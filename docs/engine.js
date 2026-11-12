@@ -101,6 +101,12 @@ export function currentPlayer(state) {
   return state.players[state.currentPlayer];
 }
 
+export function currentAgent(state) {
+  if (state.opponent === "agents") return state.agents[state.currentPlayer];
+  return state.currentPlayer === 1 && ["greedy", "dp", "quackle", "dqn"].includes(state.opponent)
+    ? state.opponent : null;
+}
+
 export function refillRack(state, player) {
   while (player.rack.length < RACK_SIZE && state.bag.length) {
     player.rack.push(state.bag.pop());
@@ -365,6 +371,13 @@ export function validateSavedState(value) {
     if (!Array.isArray(value.board) || value.board.length !== BOARD_SIZE) return false;
     if (!value.board.every(row => Array.isArray(row) && row.length === BOARD_SIZE && row.every(tile => tile === null || validBoardTile(tile)))) return false;
     if (!Array.isArray(value.players) || value.players.length < 2 || value.players.length > 4) return false;
+    if (value.opponent !== undefined && !["human", "greedy", "dp", "quackle", "dqn", "agents"].includes(value.opponent)) return false;
+    if (["greedy", "dp", "quackle", "dqn", "agents"].includes(value.opponent) && value.players.length !== 2) return false;
+    if (value.opponent === "agents") {
+      if (!Array.isArray(value.agents) || value.agents.length !== 2
+        || !value.agents.every(agent => ["greedy", "dp", "quackle", "dqn"].includes(agent))
+        || typeof value.agentPaused !== "boolean") return false;
+    } else if (value.agents !== undefined || value.agentPaused !== undefined) return false;
     normalizePlayerNames(value.players.map(player => player?.name));
     if (!value.players.every(player => player && Number.isInteger(player.score) && Array.isArray(player.rack)
       && player.rack.length <= RACK_SIZE && player.rack.every(validRackTile))) return false;

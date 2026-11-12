@@ -1,137 +1,285 @@
 <!doctype html>
 <html lang="en" data-theme="dark">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Playable browser adaptation of the MasterChiefProject Java Scrabble rules engine.">
-  <meta name="color-scheme" content="dark light">
-  <title>Scrabble | Browser Demo</title>
-  <link rel="stylesheet" href="style.css">
-</head>
-<body>
-  <header class="topbar">
-    <div>
-      <div class="eyebrow">MASTERCHIEFPROJECT</div>
-      <h1>Scrabble</h1>
-      <p>Java 17 rules engine with a local multiplayer browser adaptation</p>
-    </div>
-    <div class="top-actions" aria-label="Page controls">
-      <button id="theme-toggle" class="button button-ghost" type="button">Light mode</button>
-      <button id="save-game" class="button button-ghost" type="button">Save game</button>
-      <button id="load-game" class="button button-ghost" type="button">Load save</button>
-      <button id="new-game" class="button" type="button">New game</button>
-    </div>
-  </header>
-
-  <main class="layout">
-    <section class="board-card" aria-label="Game board">
-      <div class="board-heading">
-        <div>
-          <span class="section-label">BOARD</span>
-          <h2 id="turn-title">Loading game…</h2>
-        </div>
-        <div class="dictionary-state" id="dictionary-state">Loading dictionary…</div>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Playable browser adaptation of the MasterChiefProject Java Scrabble rules engine."
+    />
+    <meta name="color-scheme" content="dark light" />
+    <title>Scrabble | Browser Demo</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">SCRABBLE ENGINES</div>
+        <h1>Scrabble</h1>
+        <p>Play locally with friends or challenge Scrabble agents</p>
       </div>
-      <div class="board-wrap">
-        <div id="board" class="board" role="grid" aria-label="15 by 15 word board"></div>
+      <div class="top-actions" aria-label="Page controls">
+        <button id="theme-toggle" class="button button-ghost" type="button">
+          Light mode
+        </button>
+        <button id="save-game" class="button button-ghost" type="button">
+          Save game
+        </button>
+        <button id="load-game" class="button button-ghost" type="button">
+          Load save
+        </button>
+        <button id="play-agent" class="button" type="button">
+          Play against agent
+        </button>
+        <button id="agents-match" class="button" type="button">
+          Agents vs agents
+        </button>
+        <button id="new-game" class="button" type="button">New game</button>
       </div>
-      <div class="legend" aria-label="Premium square legend">
-        <span><i class="legend-swatch dl"></i>Double letter</span>
-        <span><i class="legend-swatch tl"></i>Triple letter</span>
-        <span><i class="legend-swatch dw"></i>Double word</span>
-        <span><i class="legend-swatch tw"></i>Triple word</span>
-        <span><i class="legend-swatch center"></i>Center</span>
-      </div>
-    </section>
+    </header>
 
-    <aside class="sidebar">
-      <section class="panel score-panel">
-        <div class="section-label">SCORE</div>
-        <div id="scoreboard" class="scoreboard"></div>
-        <div class="meta-row">
-          <span>Tiles in bag</span>
-          <strong id="bag-count">0</strong>
-        </div>
-        <div class="meta-row">
-          <span>Scoreless turns</span>
-          <strong id="scoreless-count">0 / 6</strong>
-        </div>
-      </section>
-
-      <section class="panel rack-panel">
-        <div class="rack-heading">
+    <main class="layout">
+      <section class="board-card" aria-label="Game board">
+        <div class="board-heading">
           <div>
-            <div class="section-label">CURRENT RACK</div>
-            <h3 id="rack-player">Player</h3>
+            <span class="section-label">BOARD</span>
+            <h2 id="turn-title">Loading game…</h2>
           </div>
-          <span id="mode-label" class="mode-label">Placement mode</span>
+          <div class="dictionary-state" id="dictionary-state">
+            Loading dictionary…
+          </div>
         </div>
-        <div id="rack" class="rack" aria-label="Current player's rack"></div>
-        <p id="rack-help" class="help">Select a rack tile, then click an empty board square.</p>
-      </section>
-
-      <section class="panel actions-panel">
-        <div id="status" class="status" role="status" aria-live="polite">Loading…</div>
-        <div class="action-grid">
-          <button id="commit-move" class="button" type="button">Commit move</button>
-          <button id="recall-tiles" class="button button-ghost" type="button">Recall tiles</button>
-          <button id="exchange-tiles" class="button button-ghost" type="button">Exchange tiles</button>
-          <button id="pass-turn" class="button button-ghost" type="button">Pass</button>
+        <div class="board-wrap">
+          <div
+            id="board"
+            class="board"
+            role="grid"
+            aria-label="15 by 15 word board"
+          ></div>
+        </div>
+        <div class="legend" aria-label="Premium square legend">
+          <span><i class="legend-swatch dl"></i>Double letter</span>
+          <span><i class="legend-swatch tl"></i>Triple letter</span>
+          <span><i class="legend-swatch dw"></i>Double word</span>
+          <span><i class="legend-swatch tw"></i>Triple word</span>
+          <span><i class="legend-swatch center"></i>Center</span>
         </div>
       </section>
 
-      <section class="panel history-panel">
-        <div class="section-label">TURN HISTORY</div>
-        <ol id="history" class="history"></ol>
-      </section>
+      <aside class="sidebar">
+        <section class="panel score-panel">
+          <div class="section-label">SCORE</div>
+          <div id="scoreboard" class="scoreboard"></div>
+          <div class="meta-row">
+            <span>Tiles in bag</span>
+            <strong id="bag-count">0</strong>
+          </div>
+          <div class="meta-row">
+            <span>Scoreless turns</span>
+            <strong id="scoreless-count">0 / 6</strong>
+          </div>
+        </section>
 
-      <section class="panel project-panel">
-        <div class="section-label">PROJECT</div>
-        <p>The browser demo mirrors the Java placement, scoring, exchange, and end-game rules. Games auto-save locally after each completed turn.</p>
-        <a href="https://github.com/MasterChiefProject/Scrabble" target="_blank" rel="noreferrer">View Java source on GitHub</a>
-      </section>
-    </aside>
-  </main>
+        <section class="panel rack-panel">
+          <div class="rack-heading">
+            <div>
+              <div class="section-label">CURRENT RACK</div>
+              <h3 id="rack-player">Player</h3>
+            </div>
+            <span id="mode-label" class="mode-label">Placement mode</span>
+          </div>
+          <div id="rack" class="rack" aria-label="Current player's rack"></div>
+          <p id="rack-help" class="help">
+            Select a rack tile, then click an empty board square.
+          </p>
+        </section>
 
-  <footer>
-    <span>Dictionary data derived from CMU Pronouncing Dictionary. This demo is not an official tournament word list.</span>
-    <a href="CMUDICT-LICENSE.txt" target="_blank" rel="noreferrer">Dictionary license</a>
-  </footer>
+        <section class="panel actions-panel">
+          <div id="status" class="status" role="status" aria-live="polite">
+            Loading…
+          </div>
+          <button
+            id="retry-agent"
+            class="button button-ghost"
+            type="button"
+            hidden
+          >
+            Retry Greedy turn
+          </button>
+          <div id="match-controls" hidden>
+            <p class="help">Watch the match, pause at any time, or step one turn while paused.</p>
+            <button id="pause-match" class="button" type="button">Pause</button>
+            <button id="step-match" class="button button-ghost" type="button">Step one turn</button>
+          </div>
+          <div class="action-grid">
+            <button id="commit-move" class="button" type="button">
+              Commit move
+            </button>
+            <button id="recall-tiles" class="button button-ghost" type="button">
+              Recall tiles
+            </button>
+            <button
+              id="exchange-tiles"
+              class="button button-ghost"
+              type="button"
+            >
+              Exchange tiles
+            </button>
+            <button id="pass-turn" class="button button-ghost" type="button">
+              Pass
+            </button>
+          </div>
+        </section>
 
-  <dialog id="new-game-dialog" aria-labelledby="new-game-title">
-    <form id="new-game-form" method="dialog" class="dialog-card">
-      <div class="dialog-heading">
-        <div>
-          <div class="section-label">NEW GAME</div>
-          <h2 id="new-game-title">Configure players</h2>
+        <section class="panel history-panel">
+          <div class="section-label">TURN HISTORY</div>
+          <ol id="history" class="history"></ol>
+        </section>
+
+        <section class="panel project-panel">
+          <div class="section-label">PROJECT</div>
+          <p>
+            Greedy maximizes immediate points. Approximate DP looks ahead using
+            its remaining rack, without forecasting draws or opponent moves.
+            Games auto-save locally.
+          </p>
+          <a
+            href="https://github.com/MasterChiefProject/Scrabble"
+            target="_blank"
+            rel="noreferrer"
+            >View Java source on GitHub</a
+          >
+        </section>
+      </aside>
+    </main>
+
+    <footer>
+      <span
+        >Dictionary data derived from CMU Pronouncing Dictionary. This demo is
+        not an official tournament word list.</span
+      >
+      <a href="CMUDICT-LICENSE.txt" target="_blank" rel="noreferrer"
+        >Dictionary license</a
+      >
+    </footer>
+
+    <dialog id="new-game-dialog" aria-labelledby="new-game-title">
+      <form id="new-game-form" method="dialog" class="dialog-card">
+        <div class="dialog-heading">
+          <div>
+            <div class="section-label">NEW GAME</div>
+            <h2 id="new-game-title">Configure players</h2>
+          </div>
+          <button
+            id="dialog-close"
+            class="icon-button"
+            type="button"
+            aria-label="Close new game dialog"
+          >
+            ×
+          </button>
         </div>
-        <button id="dialog-close" class="icon-button" type="button" aria-label="Close new game dialog">×</button>
-      </div>
 
-      <label class="field">
-        <span>Number of players</span>
-        <select id="player-count">
-          <option value="2" selected>2 players</option>
-          <option value="3">3 players</option>
-          <option value="4">4 players</option>
-        </select>
-      </label>
+        <label class="field">
+          <span>Opponent</span>
+          <select id="opponent">
+            <option value="human">Local players (pass and play)</option>
+            <option value="greedy">Greedy agent</option>
+            <option value="dp">DP agent (approximate lookahead)</option>
+            <option value="quackle" disabled>Quackle static (local server required)</option>
+            <option value="agents">Agents vs agents</option>
+            <option value="dqn" disabled>DQN (local trained checkpoint required)</option>
+          </select>
+        </label>
+        <div id="agent-match-fields" hidden>
+          <label class="field">
+            <span>Player 1 agent</span>
+            <select id="agent-one">
+              <option value="greedy">Greedy</option>
+              <option value="dp">DP (approximate lookahead)</option>
+              <option value="quackle" disabled>Quackle static (local server required)</option>
+              <option value="dqn" disabled>DQN (local trained checkpoint required)</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Player 2 agent</span>
+            <select id="agent-two">
+              <option value="greedy">Greedy</option>
+              <option value="dp" selected>DP (approximate lookahead)</option>
+              <option value="quackle" disabled>Quackle static (local server required)</option>
+              <option value="dqn" disabled>DQN (local trained checkpoint required)</option>
+            </select>
+          </label>
+        </div>
+        <p id="quackle-state" class="help">Quackle requires the local native-engine server. Checking availability...</p>
+        <p id="dqn-state" class="help">Checking for a local DQN checkpoint...</p>
+        <p class="help">
+          You move first against agents. Greedy maximizes immediate points. DP
+          plans up to three own-rack placements, searching six candidates per
+          state with memoization; it ignores draws and opponent moves, so it is
+          not an exact solver. Quackle uses native static score-plus-rack-leave
+          evaluation, not Monte Carlo simulation. DQN scores legal moves with a
+          Double DQN network trained off-policy against Quackle. It requires a local checkpoint.
+        </p>
 
-      <div id="player-name-fields" class="player-name-fields">
-        <label class="field"><span>Player 1</span><input id="player-name-1" maxlength="40" value="Player 1" autocomplete="off"></label>
-        <label class="field"><span>Player 2</span><input id="player-name-2" maxlength="40" value="Player 2" autocomplete="off"></label>
-        <label class="field optional-player"><span>Player 3</span><input id="player-name-3" maxlength="40" value="Player 3" autocomplete="off"></label>
-        <label class="field optional-player"><span>Player 4</span><input id="player-name-4" maxlength="40" value="Player 4" autocomplete="off"></label>
-      </div>
+        <label class="field">
+          <span>Number of players</span>
+          <select id="player-count">
+            <option value="2" selected>2 players</option>
+            <option value="3">3 players</option>
+            <option value="4">4 players</option>
+          </select>
+        </label>
 
-      <div id="new-game-error" class="dialog-error" role="alert"></div>
-      <div class="dialog-actions">
-        <button id="cancel-new-game" class="button button-ghost" type="button">Cancel</button>
-        <button class="button" type="submit">Start game</button>
-      </div>
-    </form>
-  </dialog>
+        <div id="player-name-fields" class="player-name-fields">
+          <label class="field"
+            ><span>Player 1</span
+            ><input
+              id="player-name-1"
+              maxlength="40"
+              value="Player 1"
+              autocomplete="off"
+          /></label>
+          <label class="field"
+            ><span>Player 2</span
+            ><input
+              id="player-name-2"
+              maxlength="40"
+              value="Player 2"
+              autocomplete="off"
+          /></label>
+          <label class="field optional-player"
+            ><span>Player 3</span
+            ><input
+              id="player-name-3"
+              maxlength="40"
+              value="Player 3"
+              autocomplete="off"
+          /></label>
+          <label class="field optional-player"
+            ><span>Player 4</span
+            ><input
+              id="player-name-4"
+              maxlength="40"
+              value="Player 4"
+              autocomplete="off"
+          /></label>
+        </div>
 
-  <script type="module" src="app.js"></script>
-</body>
+        <div id="new-game-error" class="dialog-error" role="alert"></div>
+        <div class="dialog-actions">
+          <button
+            id="cancel-new-game"
+            class="button button-ghost"
+            type="button"
+          >
+            Cancel
+          </button>
+          <button class="button" type="submit">Start game</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script type="module" src="app.js"></script>
+  </body>
 </html>

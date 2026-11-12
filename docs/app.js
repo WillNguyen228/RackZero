@@ -6,10 +6,12 @@ import {
   MAX_SCORELESS_TURNS,
   PREMIUMS,
   RACK_SIZE,
+  analyzeMove,
   commitMove as engineCommitMove,
   createAssignedBlank,
   createGameState,
   currentPlayer,
+  currentAgent,
   exchangeTiles as engineExchangeTiles,
   normalizePlayerNames,
   passTurn as enginePassTurn,
@@ -17,6 +19,7 @@ import {
   winners
 } from "./engine.js";
 import { createGameStorage } from "./storage.js";
+import { validateModel } from "./dqn.js";
 
 const THEME_KEY = "masterchief-scrabble-theme";
 const gameStorage = createGameStorage(window.localStorage);
@@ -48,6 +51,17 @@ const cancelNewGameButton = document.getElementById("cancel-new-game");
 const playerCountElement = document.getElementById("player-count");
 const playerNameFields = [1, 2, 3, 4].map(index => document.getElementById(`player-name-${index}`));
 const newGameError = document.getElementById("new-game-error");
+const opponentElement = document.getElementById("opponent");
+const playAgentButton = document.getElementById("play-agent");
+const retryAgentButton = document.getElementById("retry-agent");
+const agentsMatchButton = document.getElementById("agents-match");
+const agentMatchFields = document.getElementById("agent-match-fields");
+const agentSelectors = [document.getElementById("agent-one"), document.getElementById("agent-two")];
+const matchControls = document.getElementById("match-controls");
+const pauseMatchButton = document.getElementById("pause-match");
+const stepMatchButton = document.getElementById("step-match");
+const quackleStateElement = document.getElementById("quackle-state");
+const dqnStateElement = document.getElementById("dqn-state");
 
 let dictionary = new Set();
 let dictionaryReady = false;
@@ -56,6 +70,204 @@ let pending = [];
 let activeRackIndex = null;
 let exchangeMode = false;
 let exchangeSelection = new Set();
+let agentWorker = null;
+let agentRequest = 0;
+let agentThinking = false;
+let agentError = false;
+let agentTimer = null;
+let agentStep = false;
+let nativeRequest = null;
+let quackleReady = false;
+let quackleChecked = false;
+let dqnModel = null;
+let dqnChecked = false;
+
+function isAgentTurn() {
+  return state && currentAgent(state) !== null && !state.gameOver;
+}
+
+function agentName(opponent = currentAgent(state)) {
+  return { dp: "DP", greedy: "Greedy", quackle: "Quackle", dqn: "DQN" }[opponent] || "Agent";
+}
+
+function cancelAgent() {
+  clearTimeout(agentTimer);
+  agentTimer = null;
+  agentStep = false;
+  agentRequest += 1;
+  nativeRequest?.abort();
+  nativeRequest = null;
+  agentWorker?.terminate();
+  agentWorker = null;
+  agentThinking = false;
+  agentError = false;
+}
+
+function failAgent(message) {
+  cancelAgent();
+  agentError = true;
+  setStatus(`${agentName()} could not complete its turn: ${message}. Retry or start/load another game.`, "error");
+  renderAll();
+}
+
+function scheduleAgentTurn() {
+  if (!isAgentTurn() || !dictionaryReady || agentThinking || agentError || agentTimer !== null) return;
+  if (currentAgent(state) === "quackle") {
+    if (!quackleChecked) return;
+    if (!quackleReady) {
+      failAgent("Native Quackle is unavailable. Open the game through python -m scrabble_gym.quackle_server");
+      return;
+    }
+  }
+  if (currentAgent(state) === "dqn") {
+    if (!dqnChecked) return;
+    if (!dqnModel) {
+      failAgent("DQN checkpoint unavailable. Train a model and use the local Quackle server");
+      return;
+    }
+  }
+  if (state.opponent === "agents") {
+    if (state.agentPaused && !agentStep) return;
+    agentTimer = setTimeout(() => {
+      agentTimer = null;
+      startAgentTurn();
+      renderAll();
+    }, agentStep ? 0 : 650);
+    return;
+  }
+  startAgentTurn();
+}
+
+function startAgentTurn() {
+  agentStep = false;
+  agentThinking = true;
+  setStatus(`${agentName()} is thinking…`);
+  const id = ++agentRequest;
+  const position = { board: state.board, rack: currentPlayer(state).rack, bagSize: state.bag.length };
+  if (currentAgent(state) === "quackle") {
+    nativeRequest = new AbortController();
+    fetch("/api/quackle/move", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(position),
+      signal: nativeRequest.signal
+    }).then(async response => {
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `Quackle server returned HTTP ${response.status}`);
+      receiveAgentResult({ ...data, id });
+    }).catch(error => {
+      if (id !== agentRequest) return;
+      failAgent(error.message);
+    });
+    return;
+  }
+  try {
+    if (!agentWorker) {
+      agentWorker = new Worker(new URL("./agent-worker.js", import.meta.url), { type: "module" });
+      agentWorker.onmessage = ({ data }) => receiveAgentResult(data);
+      agentWorker.onerror = event => {
+        event.preventDefault();
+        failAgent(event.message || "Agent worker failed to load");
+      };
+      agentWorker.postMessage({ type: "initialize", words: [...dictionary], dqnModel });
+    }
+    if (currentAgent(state) === "dqn") {
+      position.scores = [currentPlayer(state).score, state.players[1 - state.currentPlayer].score];
+      position.opponentRackSize = state.players[1 - state.currentPlayer].rack.length;
+      position.scorelessTurns = state.scorelessTurns;
+    }
+    // Send only public board information and the acting agent's own rack.
+    agentWorker.postMessage({
+      type: "move", id, opponent: currentAgent(state),
+      position
+    });
+  } catch (error) {
+    failAgent(error.message);
+  }
+}
+
+function receiveAgentResult(data) {
+  if (data.id !== undefined && data.id !== agentRequest) return;
+  if (!isAgentTurn() || !agentThinking) return;
+  if (data.error) {
+    failAgent(data.error);
+    return;
+  }
+  try {
+    const action = data.action;
+    const name = currentPlayer(state).name;
+    const suffix = state.opponent === "agents" ? "" : " Your turn.";
+    let summary;
+    if (action.kind === "place") {
+      const preview = analyzeMove(state, action.placements, dictionary);
+      if (preview.score !== action.score) throw new Error("Agent and browser scores disagree; no move committed.");
+      const result = engineCommitMove(state, action.placements, dictionary);
+      summary = `${name} played ${result.words.join(", ")} for ${result.score} points.${suffix}`;
+    } else if (action.kind === "exchange") {
+      engineExchangeTiles(state, action.rackIndexes);
+      summary = `${name} exchanged ${action.rackIndexes.length} tiles.${suffix}`;
+    } else if (action.kind === "pass") {
+      enginePassTurn(state);
+      summary = `${name} passed.${suffix}`;
+    } else {
+      throw new Error("Unknown agent action.");
+    }
+    nativeRequest = null;
+    agentThinking = false;
+    clearTransientState();
+    autoSave();
+    if (state.gameOver) announceGameOver();
+    else setStatus(summary, "success");
+    renderAll();
+  } catch (error) {
+    failAgent(error.message);
+  }
+}
+
+async function checkQuackle() {
+  try {
+    const response = await fetch("/api/quackle", { cache: "no-store" });
+    if (response.status === 404) {
+      quackleStateElement.textContent = "Quackle is local-only. Start python -m scrabble_gym.quackle_server to enable it.";
+    } else {
+      const data = await response.json();
+      if (!response.ok || data.available !== true) throw new Error(data.error || "Native engine unavailable");
+      quackleReady = true;
+      quackleStateElement.textContent = "Native Quackle static policy connected (shared demo lexicon).";
+    }
+  } catch (error) {
+    quackleStateElement.textContent = `Quackle unavailable: ${error.message}. Use the local Quackle server.`;
+  }
+  quackleChecked = true;
+  document.querySelectorAll('option[value="quackle"]').forEach(option => { option.disabled = !quackleReady; });
+  renderAll();
+}
+
+async function checkDQN() {
+  dqnModel = null;
+  try {
+    const response = await fetch("/api/dqn/model", { cache: "no-store" });
+    if (response.status === 404) {
+      dqnStateElement.textContent = "DQN needs a trained checkpoint and the local Quackle server.";
+    } else {
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      const wordsResponse = await fetch("words.txt", { cache: "no-store" });
+      if (!wordsResponse.ok) throw new Error("Cannot verify DQN dictionary");
+      const digest = await crypto.subtle.digest("SHA-256", await wordsResponse.arrayBuffer());
+      const hash = [...new Uint8Array(digest)].map(n => n.toString(16).padStart(2, "0")).join("");
+      if (hash !== data.dictionary_sha256) throw new Error("DQN dictionary mismatch; retrain the model");
+      dqnModel = validateModel(data);
+      dqnStateElement.textContent = `DQN checkpoint loaded: ${data.episodes} training episodes, ${data.updates} updates. Training amount is not a strength guarantee.`;
+    }
+  } catch (error) {
+    dqnStateElement.textContent = `DQN unavailable: ${error.message}`;
+  }
+  dqnChecked = true;
+  agentWorker?.postMessage({ type: "dqn-model", model: dqnModel });
+  document.querySelectorAll('option[value="dqn"]').forEach(option => { option.disabled = !dqnModel; });
+  renderAll();
+}
 
 function initializeState() {
   const restored = gameStorage.readAuto();
@@ -112,6 +324,7 @@ function renderBoard() {
     for (let col = 0; col < BOARD_SIZE; col += 1) {
       const button = document.createElement("button");
       button.type = "button";
+      button.disabled = state.gameOver || isAgentTurn();
       const premium = PREMIUMS[row][col];
       const fixedTile = state.board[row][col];
       const temp = pendingAt(row, col);
@@ -138,7 +351,7 @@ function renderBoard() {
 }
 
 function handleBoardClick(row, col) {
-  if (state.gameOver) return;
+  if (state.gameOver || isAgentTurn()) return;
 
   const tempIndex = pending.findIndex(item => item.row === row && item.col === col);
   if (tempIndex >= 0) {
@@ -193,6 +406,7 @@ function handleBoardClick(row, col) {
 
 function renderRack() {
   rackElement.innerHTML = "";
+  if (isAgentTurn()) return;
   const player = currentPlayer(state);
   player.rack.forEach((tile, index) => {
     const button = document.createElement("button");
@@ -271,9 +485,18 @@ function renderStats() {
   bagCountElement.textContent = state.bag.length;
   scorelessElement.textContent = `${state.scorelessTurns} / ${MAX_SCORELESS_TURNS}`;
   turnTitleElement.textContent = state.gameOver ? "Game over" : `${player.name}'s turn`;
+  if (["greedy", "dp", "quackle", "dqn"].includes(state.opponent)) turnTitleElement.textContent += ` · vs ${agentName(state.opponent)}`;
+  if (state.opponent === "agents") {
+    turnTitleElement.textContent += ` · ${state.agents.map(agent => agentName(agent)).join(" vs ")}`;
+  }
   rackPlayerElement.textContent = player.name;
 
-  if (exchangeMode) {
+  if (isAgentTurn()) {
+    modeLabelElement.textContent = agentError || state.agentPaused ? "Agent paused" : "Agent turn";
+    rackHelpElement.textContent = state.opponent === "agents"
+      ? "Spectator mode: agent racks stay hidden. Pause to inspect the board or step one turn."
+      : `${agentName()}'s rack is hidden. Your rack returns after its turn.`;
+  } else if (exchangeMode) {
     modeLabelElement.textContent = "Exchange mode";
     rackHelpElement.textContent = "Select one or more rack tiles, then click Confirm exchange. Exchanges require at least seven tiles in the bag.";
   } else {
@@ -283,15 +506,25 @@ function renderStats() {
 }
 
 function updateActionState() {
-  commitButton.disabled = state.gameOver || !pending.length || !dictionaryReady || exchangeMode;
-  recallButton.disabled = state.gameOver || (!pending.length && !exchangeMode);
-  passButton.disabled = state.gameOver || pending.length > 0 || exchangeMode;
-  exchangeButton.disabled = state.gameOver || pending.length > 0 || state.bag.length < RACK_SIZE;
+  const locked = state.gameOver || isAgentTurn();
+  commitButton.disabled = locked || !pending.length || !dictionaryReady || exchangeMode;
+  recallButton.disabled = locked || (!pending.length && !exchangeMode);
+  passButton.disabled = locked || pending.length > 0 || exchangeMode;
+  exchangeButton.disabled = locked || pending.length > 0 || state.bag.length < RACK_SIZE;
+  retryAgentButton.hidden = !agentError || !isAgentTurn();
+  retryAgentButton.textContent = `Retry ${agentName()} turn`;
+  retryAgentButton.disabled = !dictionaryReady;
+  matchControls.hidden = state.opponent !== "agents";
+  pauseMatchButton.textContent = state.agentPaused ? "Resume" : "Pause";
+  pauseMatchButton.disabled = state.gameOver;
+  stepMatchButton.disabled = state.gameOver || !state.agentPaused || !dictionaryReady
+    || agentThinking || agentTimer !== null || agentError;
   exchangeButton.textContent = exchangeMode ? "Confirm exchange" : "Exchange tiles";
   loadButton.disabled = !gameStorage.hasManual();
 }
 
 function renderAll() {
+  scheduleAgentTurn();
   renderBoard();
   renderRack();
   renderScoreboard();
@@ -301,6 +534,7 @@ function renderAll() {
 }
 
 function commitMove() {
+  if (state.gameOver || isAgentTurn()) return;
   if (!dictionaryReady) {
     setStatus("Dictionary is still loading.", "warning");
     return;
@@ -323,6 +557,7 @@ function commitMove() {
 }
 
 function startOrConfirmExchange() {
+  if (state.gameOver || isAgentTurn()) return;
   if (!exchangeMode) {
     exchangeMode = true;
     exchangeSelection.clear();
@@ -354,6 +589,7 @@ function startOrConfirmExchange() {
 }
 
 function passTurn() {
+  if (state.gameOver || isAgentTurn()) return;
   if (pending.length || exchangeMode) {
     setStatus("Recall pending tiles or leave exchange mode before passing.", "warning");
     return;
@@ -381,6 +617,7 @@ function announceGameOver() {
 }
 
 function recallTiles() {
+  if (state.gameOver || isAgentTurn()) return;
   if (exchangeMode) {
     exchangeMode = false;
     exchangeSelection.clear();
@@ -414,6 +651,7 @@ function loadManualSave() {
     updateActionState();
     return;
   }
+  cancelAgent();
   state = loaded;
   clearTransientState();
   autoSave();
@@ -440,7 +678,7 @@ async function loadDictionary() {
   dictionaryStateElement.textContent = "Loading dictionary…";
   dictionaryStateElement.className = "dictionary-state";
   try {
-    const response = await fetch("words.txt", { cache: "force-cache" });
+    const response = await fetch("words.txt", { cache: "no-store" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const text = await response.text();
     dictionary = new Set(text.split(/\s+/).map(word => word.trim().toUpperCase()).filter(Boolean));
@@ -456,7 +694,7 @@ async function loadDictionary() {
     dictionaryStateElement.classList.add("error");
     setStatus(`Dictionary could not be loaded: ${error.message}. Serve the site through GitHub Pages or another HTTP server.`, "error");
   }
-  updateActionState();
+  renderAll();
 }
 
 function applyTheme(theme) {
@@ -479,6 +717,10 @@ function openNewGameDialog() {
   const names = state?.players?.map(player => player.name) ?? ["Player 1", "Player 2"];
   playerCountElement.value = String(Math.min(Math.max(names.length, 2), 4));
   playerNameFields.forEach((input, index) => { input.value = names[index] || `Player ${index + 1}`; });
+  opponentElement.value = state?.opponent || "human";
+  agentSelectors.forEach((select, index) => {
+    select.value = state?.agents?.[index] || (index === 0 ? "greedy" : "dp");
+  });
   newGameError.textContent = "";
   updatePlayerNameFields();
   if (typeof newGameDialog.showModal === "function") newGameDialog.showModal();
@@ -491,12 +733,23 @@ function closeNewGameDialog() {
 }
 
 function updatePlayerNameFields() {
+  const match = opponentElement.value === "agents";
+  const againstAgent = ["greedy", "dp", "quackle", "dqn", "agents"].includes(opponentElement.value);
+  agentMatchFields.hidden = !match;
+  agentSelectors.forEach(select => { select.disabled = !match; });
+  playerCountElement.disabled = againstAgent;
+  if (againstAgent) playerCountElement.value = "2";
+  if (match) {
+    agentSelectors.forEach((select, index) => {
+      playerNameFields[index].value = `${agentName(select.value)} ${index + 1}`;
+    });
+  } else if (againstAgent) playerNameFields[1].value = agentName(opponentElement.value);
   const count = Number(playerCountElement.value);
   playerNameFields.forEach((input, index) => {
     const field = input.closest("label");
     const visible = index < count;
     field.hidden = !visible;
-    input.disabled = !visible;
+    input.disabled = !visible || match || (againstAgent && index === 1);
     input.required = visible;
   });
 }
@@ -506,8 +759,28 @@ function startConfiguredGame(event) {
   const count = Number(playerCountElement.value);
   const names = playerNameFields.slice(0, count).map(input => input.value);
   try {
+    if (!["human", "greedy", "dp", "quackle", "dqn", "agents"].includes(opponentElement.value)) {
+      throw new Error("That opponent is not implemented yet.");
+    }
     const normalized = normalizePlayerNames(names);
-    state = createGameState(normalized);
+    const nextState = createGameState(normalized);
+    nextState.opponent = opponentElement.value;
+    if (nextState.opponent === "agents") {
+      const agents = agentSelectors.map(select => select.value);
+      if (!agents.every(agent => ["greedy", "dp", "quackle", "dqn"].includes(agent))) {
+        throw new Error("Choose an implemented agent for both players.");
+      }
+      nextState.agents = agents;
+      nextState.agentPaused = false;
+    }
+    if ((nextState.opponent === "quackle" || nextState.agents?.includes("quackle")) && !quackleReady) {
+      throw new Error("Quackle requires the local native-engine server.");
+    }
+    if ((nextState.opponent === "dqn" || nextState.agents?.includes("dqn")) && !dqnModel) {
+      throw new Error("DQN requires a compatible trained checkpoint from the local server.");
+    }
+    cancelAgent();
+    state = nextState;
   } catch (error) {
     newGameError.textContent = error.message;
     return;
@@ -516,7 +789,9 @@ function startConfiguredGame(event) {
   clearTransientState();
   gameStorage.writeAuto(state);
   closeNewGameDialog();
-  setStatus(`${state.players[0].name} starts. Build the first word through the center star.`, "success");
+  setStatus(state.opponent === "agents"
+    ? "Agent match started. Pause to inspect the board or step through turns."
+    : `${state.players[0].name} starts. Build the first word through the center star.`, "success");
   renderAll();
 }
 
@@ -525,6 +800,44 @@ recallButton.addEventListener("click", recallTiles);
 exchangeButton.addEventListener("click", startOrConfirmExchange);
 passButton.addEventListener("click", passTurn);
 newGameButton.addEventListener("click", openNewGameDialog);
+playAgentButton.addEventListener("click", () => {
+  openNewGameDialog();
+  opponentElement.value = "greedy";
+  updatePlayerNameFields();
+});
+opponentElement.addEventListener("change", updatePlayerNameFields);
+agentsMatchButton.addEventListener("click", () => {
+  openNewGameDialog();
+  opponentElement.value = "agents";
+  updatePlayerNameFields();
+});
+agentSelectors.forEach(select => select.addEventListener("change", updatePlayerNameFields));
+pauseMatchButton.addEventListener("click", () => {
+  if (state.opponent !== "agents" || state.gameOver) return;
+  state.agentPaused = !state.agentPaused;
+  if (state.agentPaused) cancelAgent();
+  setStatus(state.agentPaused ? "Match paused. Step one turn or resume playback." : "Match resumed.");
+  autoSave();
+  renderAll();
+});
+stepMatchButton.addEventListener("click", () => {
+  if (state.opponent !== "agents" || !state.agentPaused || state.gameOver
+    || agentThinking || agentTimer !== null || agentError) return;
+  agentStep = true;
+  renderAll();
+});
+retryAgentButton.addEventListener("click", () => {
+  cancelAgent();
+  if (state.opponent === "agents" && state.agentPaused) agentStep = true;
+  if (currentAgent(state) === "quackle") {
+    quackleChecked = false;
+    quackleReady = false;
+    checkQuackle();
+  } else if (currentAgent(state) === "dqn") {
+    dqnChecked = false;
+    checkDQN();
+  } else renderAll();
+});
 saveButton.addEventListener("click", saveGame);
 loadButton.addEventListener("click", loadManualSave);
 themeButton.addEventListener("click", toggleTheme);
@@ -540,3 +853,5 @@ newGameDialog.addEventListener("cancel", event => {
 initializeTheme();
 initializeState();
 loadDictionary();
+checkQuackle();
+checkDQN();

@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 3.16)
+project(scrabble_quackle_bridge LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(QUACKLE_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/quackle")
+add_subdirectory("${QUACKLE_SOURCE}" quackle)
+add_executable(quackle_bridge main.cpp)
+target_include_directories(quackle_bridge PRIVATE "${QUACKLE_SOURCE}")
+target_link_libraries(quackle_bridge PRIVATE libquackle)
+if(MINGW)
+  target_link_options(quackle_bridge PRIVATE -static)
+endif()

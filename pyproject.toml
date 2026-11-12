@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scrabble-gym"
+version = "0.1.0"
+description = "Gymnasium interface to the Scrabble Java rules engine"
+requires-python = ">=3.10"
+dependencies = [
+    "gymnasium>=1.0,<2",
+    "numpy>=1.24",
+    "JPype1>=1.5.2,<2",
+]
+
+[project.optional-dependencies]
+learning = ["torch>=2.6,<3"]
+
+[tool.setuptools.packages.find]
+where = ["python"]

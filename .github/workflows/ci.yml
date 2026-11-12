@@ -47,3 +47,78 @@ jobs:
 
       - name: Run browser engine tests
         run: npm run test:web
+
+  gymnasium:
+    name: Gymnasium (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.13']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install Gymnasium interface
+        run: python -m pip install -e .
+
+      - name: Build Java engine for Gymnasium
+        run: python -m scrabble_gym.build
+
+      - name: Test Java-backed Gymnasium interface
+        run: python -m unittest discover -s tests/python -v
+
+  quackle:
+    name: Native Quackle integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout Quackle source
+        uses: actions/checkout@v4
+        with:
+          repository: quackle/quackle
+          ref: 35e11bb21a3bf362c533541d0b5fe8ad92a0c08f
+          path: third_party/quackle
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install Gymnasium and learning interface
+        run: python -m pip install -e ".[learning]" --extra-index-url https://download.pytorch.org/whl/cpu
+
+      - name: Set up Node.js for inference parity tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build Java engine
+        run: python -m scrabble_gym.build
+
+      - name: Build native Quackle bridge
+        run: python -m scrabble_gym.quackle_build
+
+      - name: Test native integration and learning
+        run: python -m unittest discover -s tests/python -v

@@ -1,0 +1,16 @@
+SPDX-License-Identifier: GPL-3.0-or-later
+
+The native Quackle bridge in this directory is free software: you can
+redistribute it and/or modify it under the terms of the GNU General Public
+License as published by the Free Software Foundation, either version 3 of
+the License, or (at your option) any later version.
+
+It is distributed WITHOUT ANY WARRANTY; without even the implied warranty
+of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+The linked Quackle engine retains its upstream copyright notices and
+GPL-3.0-or-later license. The complete license is provided in
+third_party/quackle/LICENSE after the documented source checkout, and at
+https://www.gnu.org/licenses/gpl-3.0.html.
+
+This directory is not licensed under the repository's root license.

@@ -24,3 +24,14 @@ Thumbs.db
 *.log
 *.tmp
 *.swp
+
+# Python / Gymnasium
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
+
+# Independently licensed upstream source checkouts
+/third_party/quackle/
