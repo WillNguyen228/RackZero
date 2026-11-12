@@ -4,7 +4,9 @@
 
 **Scrabble** is a Java 17 word-board game engine with full board validation and scoring, exact dictionary lookup, a bounded TCP dictionary service, automated tests, and a browser-playable multiplayer adaptation.
 
-**Playable demo:** https://masterchiefproject.github.io/Scrabble/
+**Playable demo:** [RackZero browser demo](https://willnguyen228.github.io/RackZero/)
+
+The browser demo is deployed from `docs/` to GitHub Pages on pushes to `main`.
 
 The Java implementation is the primary rules engine. A JavaScript browser adaptation mirrors the main placement, scoring, exchange, and game-ending rules so the project can be evaluated without a local Java installation.
 
