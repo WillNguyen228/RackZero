@@ -83,10 +83,20 @@ def _jar_path(path: str | Path | None) -> Path:
 
 def _parse_words(text: str, source: str) -> frozenset[str]:
     words = set()
-    for number, line in enumerate(text.splitlines(), 1):
-        if line.strip().startswith("#"):
+    lines = text.splitlines()
+    headers = [line for line in lines if line.startswith("//Word\t")]
+    columns = len(headers[0].split("\t")) if headers else None
+    for number, line in enumerate(lines, 1):
+        if not line.strip() or line.strip().startswith(("#", "//")):
             continue
-        for token in line.split():
+        if columns is not None:
+            fields = line.split("\t")
+            if len(fields) != columns:
+                raise ValueError(f"{source}:{number}: expected {columns} lexicon columns")
+            tokens = fields[:1]
+        else:
+            tokens = line.split()
+        for token in tokens:
             word = token.upper()
             if not token.isascii() or not token.isalpha() or not 2 <= len(word) <= SIZE:
                 raise ValueError(f"{source}:{number}: invalid word {token!r}")
@@ -94,6 +104,21 @@ def _parse_words(text: str, source: str) -> frozenset[str]:
     if not words:
         raise ValueError(f"{source}: dictionary must not be empty")
     return frozenset(words)
+
+
+def load_words(path: str | Path) -> frozenset[str]:
+    """Read plain words or a single-text-file ZIP, including WGPO hook tables."""
+    path = Path(path)
+    if path.suffix.lower() == ".zip":
+        with ZipFile(path) as archive:
+            entries = [entry for entry in archive.infolist()
+                       if not entry.is_dir() and entry.filename.lower().endswith(".txt")]
+            if len(entries) != 1:
+                raise ValueError(f"{path}: expected exactly one .txt lexicon in ZIP")
+            entry = entries[0]
+            return _parse_words(archive.read(entry).decode("utf-8-sig"),
+                                f"{path}!{entry.filename}")
+    return _parse_words(path.read_text(encoding="utf-8-sig"), str(path))
 
 
 class ScrabbleEnv(gym.Env):
@@ -117,7 +142,7 @@ class ScrabbleEnv(gym.Env):
         if words is not None:
             self.words = frozenset(words)
         elif word_list is not None:
-            self.words = _parse_words(Path(word_list).read_text(encoding="utf-8"), str(word_list))
+            self.words = load_words(word_list)
         else:
             with ZipFile(jar) as archive:
                 # The demo dictionary also contains one-letter and overlength entries.

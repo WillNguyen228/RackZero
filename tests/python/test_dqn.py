@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock
@@ -20,10 +21,10 @@ HAS_TORCH = importlib.util.find_spec("torch") is not None
 if HAS_TORCH:
     import torch
     from scrabble_gym.dqn import (
-        ACTION_SIZE, STATE_SIZE, Candidates, DoubleDQN, Replay, Transition,
-        dictionary_hash, encode_state,
+        ACTION_SIZE, CELL_SIZE, STATE_SIZE, Candidates, DoubleDQN, Replay, Transition,
+        board_features, dictionary_hash, encode_state,
     )
-    from scrabble_gym.train_dqn import run_episode
+    from scrabble_gym.train_dqn import run_episode, summarize
 
 
 def observation(player=0):
@@ -111,13 +112,44 @@ class DoubleDQNTest(unittest.TestCase):
         features = self.actions.features(slice(None))
         self.assertEqual(features.shape, (3, ACTION_SIZE))
         self.assertEqual(self.state.shape, (STATE_SIZE,))
-        self.assertEqual(features[0, 112 * 6], 1)
-        self.assertEqual(features[1, 1350 + 26], 0)
-        self.assertEqual(features[1, 1350 + 27 + 26], 1 / 7)
+        self.assertEqual(features[0, 112 * CELL_SIZE], 1)
+        self.assertEqual(features[1, 225 * CELL_SIZE + 26], 0)
+        self.assertEqual(features[1, 225 * CELL_SIZE + 27 + 26], 1 / 7)
         for key in before:
             np.testing.assert_equal(self.obs[key], before[key])
         blank = Candidates.from_moves(self.obs, (ScoredMove(Move("place", 7, 7, 0, "AT", (0,)), 2),))
-        self.assertEqual(blank.features(slice(None))[0, 112 * 6 + 5], 1)
+        self.assertEqual(blank.features(slice(None))[0, 112 * CELL_SIZE + 26], 1)
+
+    def test_one_hot_spatial_features_encode_neighbors_edges_and_premiums(self):
+        cells = np.zeros(225, dtype=np.uint8)
+        cells[[14, 112, 113]] = [3, 1, 52]
+        features = board_features(cells).reshape(15, 15, CELL_SIZE)
+        np.testing.assert_equal(features[7, 7, :26], np.eye(26)[0])
+        np.testing.assert_equal(features[7, 8, :26], np.eye(26)[25])
+        self.assertEqual(features[7, 8, 26], 1)
+        np.testing.assert_allclose(features[7, 8, 27:29], [0.5, 8 / 14])
+        np.testing.assert_equal(features[7, 7, 29:33], [0, 0, 0, 1])
+        np.testing.assert_equal(features[7, 8, 29:33], [0, 0, 1, 0])
+        self.assertEqual(features[1, 0, 31], 0)  # No wrap from (0, 14).
+        self.assertEqual(features[7, 7, 33], 0.5)
+        self.assertEqual(features[0, 14, 33], 1)
+        self.assertEqual(features[0, 0, :27].sum(), 0)
+
+    def test_sparse_candidate_inference_matches_training_forward(self):
+        with torch.no_grad():
+            self.agent.online.layers[6].weight.fill_(0.1)
+            self.agent.online.layers[6].bias.fill_(-0.2)
+            dense = self.agent.online(
+                torch.from_numpy(self.state).expand(len(self.actions), -1),
+                torch.from_numpy(self.actions.features(slice(None))),
+            ).numpy()
+        np.testing.assert_allclose(self.agent.values(self.state, self.actions), dense, atol=1e-6)
+        groups = [self.actions, self.actions.take(2), self.actions.take(0)]
+        batched = self.agent._batch_values(
+            self.agent._split(self.agent.online), np.stack([self.state] * 3), groups,
+        )
+        np.testing.assert_allclose(batched.cpu(), np.concatenate([dense, dense[2:3], dense[:1]]),
+                                   atol=1e-6)
 
     def test_double_dqn_selects_online_but_evaluates_frozen_target(self):
         # Online prefers score; target gives that action a negative value.
@@ -127,11 +159,22 @@ class DoubleDQNTest(unittest.TestCase):
                     parameter.zero_()
                 network.layers[0].weight[0, -1] = 1
                 network.layers[2].weight[0, 0] = 1
-            self.agent.online.layers[4].weight[0, 0] = 1
-            self.agent.target.layers[4].weight[0, 0] = -1
+                network.layers[4].weight[0, 0] = 1
+            self.agent.online.layers[6].weight[0, 0] = 1
+            self.agent.target.layers[6].weight[0, 0] = -2
         targets = self.agent.bellman_targets([self.transition(), self.transition(True)])
         np.testing.assert_allclose(targets.cpu(), [0.18, 0.2], atol=1e-6)
         self.assertTrue(all(not p.requires_grad for p in self.agent.target.parameters()))
+
+    def test_untrained_residual_is_zero_so_q_starts_at_immediate_score(self):
+        np.testing.assert_allclose(DoubleDQN(seed=3).values(self.state, self.actions),
+                                   self.actions.scores / 100, atol=1e-7)
+
+    def test_bellman_candidate_subset_keeps_top_scores_and_pass(self):
+        kept = self.actions.top(2)
+        np.testing.assert_equal(kept.kinds, [0, 2])
+        np.testing.assert_equal(kept.scores, [4, 0])
+        self.assertIs(self.actions.top(None), self.actions)
 
     def test_replay_is_bounded_and_samples_off_policy(self):
         item = self.transition()
@@ -177,16 +220,27 @@ class DoubleDQNTest(unittest.TestCase):
                                     loaded.values(self.state, self.actions))
             with self.assertRaisesRegex(ValueError, "dictionary"):
                 DoubleDQN.load(checkpoint, "different")
+            data = torch.load(checkpoint, weights_only=True)
+            data["schema"] = 1
+            torch.save(data, checkpoint)
+            with self.assertRaisesRegex(ValueError, "schema"):
+                DoubleDQN.load(checkpoint, digest)
 
     @unittest.skipUnless(shutil.which("node"), "Node required for browser parity")
     def test_python_and_browser_features_and_q_values_match(self):
         from scrabble_gym.opponents import public_position
-        state = public_position(self.obs)
+        obs = copy.deepcopy(self.obs)
+        for r, c, letter, blank in [(0, 0, 3, 0), (1, 5, 26, 1), (0, 14, 1, 0), (2, 6, 2, 0)]:
+            obs["board"][r, c], obs["board_blanks"][r, c] = letter, blank
+        state = public_position(obs)
         state.update(scores=[10, 20], opponentRackSize=7, scorelessTurns=0)
         action = {"kind": "place", "score": 4, "placements": [
             {"row": 7, "col": 7, "rackIndex": 0, "tile": state["rack"][0]},
             {"row": 7, "col": 8, "rackIndex": 1, "tile": state["rack"][1]},
         ]}
+        with torch.no_grad():
+            self.agent.online.layers[6].weight.fill_(0.1)
+            self.agent.online.layers[6].bias.fill_(-0.2)
         self.agent.episodes, self.agent.updates = 1, 1
         with tempfile.TemporaryDirectory() as directory:
             model_path = Path(directory) / "policy.json"
@@ -201,13 +255,93 @@ class DoubleDQNTest(unittest.TestCase):
                 input=json.dumps(payload), text=True, capture_output=True, check=True, cwd=ROOT,
             )
         browser = json.loads(result.stdout)
-        np.testing.assert_allclose(browser["s"], self.state, atol=1e-7)
+        np.testing.assert_allclose(browser["s"], encode_state(obs), atol=1e-7)
         np.testing.assert_allclose(browser["a"], self.actions.features(slice(0, 1))[0], atol=1e-7)
-        self.assertAlmostEqual(browser["q"], float(self.agent.values(self.state, self.actions.take(0))[0]), places=5)
+        self.assertAlmostEqual(browser["q"], float(self.agent.values(encode_state(obs), self.actions.take(0))[0]), places=5)
+
+    def test_summary_excludes_truncations_and_reports_uncertainty_and_seats(self):
+        results = [
+            dict(terminated=True, win=True, tie=False, score_difference=10, learner=0),
+            dict(terminated=True, win=False, tie=True, score_difference=0, learner=1),
+            dict(terminated=False, win=True, tie=False, score_difference=1000, learner=0),
+        ]
+        summary = summarize(results)
+        self.assertEqual(summary["completed_games"], 2)
+        self.assertEqual(summary["truncated_games"], 1)
+        self.assertEqual(summary["win_rate"], 0.5)
+        self.assertEqual(summary["mean_score_difference"], 5)
+        self.assertEqual(summary["score_difference_standard_error"], 5)
+        self.assertLess(summary["win_rate_95ci"][0], 0.5)
+        self.assertGreater(summary["win_rate_95ci"][1], 0.5)
+        self.assertEqual(summary["by_seat"]["0"], {"games": 1, "wins": 1})
+        self.assertIsNone(summarize(results[2:])["mean_score_difference"])
+
+    def test_greedy_baseline_scores_placements_then_exchanges_or_passes(self):
+        cases = [
+            (self.moves + (ScoredMove(Move("place", 7, 7, 0, "TA"), 6),), 3),
+            ((ScoredMove(Move("exchange", exchange="A"), 0),
+              ScoredMove(Move("exchange", exchange="AT"), 0), ScoredMove(Move(), 0)), 1),
+            ((ScoredMove(Move(), 0),), 0),
+        ]
+        for moves, expected in cases:
+            match = Mock()
+            match.reset.return_value = (self.obs, {})
+            match.legal_moves.return_value = moves
+            match.step.return_value = (self.obs, 0, True, False,
+                                      {"scores": np.array([10, 20]), "decisions": 1})
+            run_episode(match, self.agent, seed=100000, learner=0,
+                        training=False, policy="greedy")
+            match.step.assert_called_once_with(moves[expected].move)
+        self.assertEqual((self.agent.updates, self.agent.decisions, len(self.agent.replay)),
+                         (0, 0, 0))
 
 
 @unittest.skipUnless(HAS_TORCH and (TARGET / "manifest.json").is_file(), "Build native Quackle and install learning extra")
 class DQNNativeTest(unittest.TestCase):
+    def test_cli_time_budget_saves_and_evaluation_pairs_seats_without_learning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            source = output / "words.txt"
+            source.write_text("AT CAT QI\n", encoding="utf-8")
+            command = [sys.executable, "-m", "scrabble_gym.train_dqn",
+                       "--word-list", str(source), "--output", str(output),
+                       "--max-decisions", "1"]
+            subprocess.run(
+                command + ["--episodes", "100", "--time-limit-seconds", "0.001",
+                           "--batch-size", "1", "--warmup", "1", "--train-every", "1"],
+                check=True, capture_output=True, text=True, cwd=ROOT,
+            )
+            agent = DoubleDQN.load(output / "checkpoint.pt", dictionary_hash(source))
+            self.assertEqual(agent.episodes, 1)
+            self.assertEqual(agent.updates, 1)
+            summary = json.loads((output / "training-summary.json").read_text())
+            self.assertEqual(summary["requested_episodes"], 100)
+            self.assertEqual(summary["training_episodes"], 1)
+            self.assertEqual(summary["stop_reason"], "time_budget")
+            subprocess.run(
+                command + ["--evaluate", str(output / "checkpoint.pt"),
+                           "--episodes", "2", "--seed", "100000", "--workers", "2"],
+                check=True, capture_output=True, text=True, cwd=ROOT,
+            )
+            results = [json.loads(line) for line in
+                       (output / "evaluation.jsonl").read_text().splitlines()]
+            self.assertEqual([(r["seed"], r["learner"]) for r in results],
+                             [(100000, 0), (100000, 1)])
+            self.assertTrue(all(r["updates"] == 1 for r in results))
+            summary = json.loads((output / "evaluation-summary.json").read_text())
+            self.assertEqual(summary["training_episodes"], 1)
+            self.assertEqual(summary["stop_reason"], "episode_limit")
+            subprocess.run(
+                command + ["--baseline", "untrained", "--baseline-network-seed", "1",
+                           "--episodes", "2", "--seed", "100000"],
+                check=True, capture_output=True, text=True, cwd=ROOT,
+            )
+            baseline = [json.loads(line) for line in
+                        (output / "untrained.jsonl").read_text().splitlines()]
+            self.assertTrue(all(r["updates"] == 0 and r["network_seed"] == 1 for r in baseline))
+            self.assertEqual(DoubleDQN.load(
+                output / "checkpoint.pt", dictionary_hash(source)).decisions, 1)
+
     @unittest.skipUnless(shutil.which("node"), "Node required for legal-candidate parity")
     def test_browser_and_java_enumerate_the_same_legal_physical_candidates(self):
         match = QuackleMatch()

@@ -33,5 +33,8 @@ __pycache__/
 /build/
 /dist/
 
+# User-supplied local training lexicon
+/WOW24v3.zip
+
 # Independently licensed upstream source checkouts
 /third_party/quackle/

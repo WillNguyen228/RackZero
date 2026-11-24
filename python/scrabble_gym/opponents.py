@@ -1,5 +1,7 @@
 """Public-position adapters and learner-to-learner turns against native Quackle."""
 
+from pathlib import Path
+
 import numpy as np
 
 from .environment import ALPHABET, DIRECTIONS, Move, ScrabbleEnv
@@ -57,18 +59,24 @@ def native_move(action: dict, position: dict) -> Move:
 class QuackleMatch:
     """One step ends at the learner's next decision, never the opponent's."""
 
-    def __init__(self, *, bridge: QuackleBridge | None = None, max_decisions: int = 100):
+    def __init__(self, *, bridge: QuackleBridge | None = None, max_decisions: int = 100,
+                 word_list: Path | None = None):
         if max_decisions < 1:
             raise ValueError("max_decisions must be positive")
-        self.bridge = bridge if bridge is not None else QuackleBridge()
-        self.env = ScrabbleEnv(max_turns=2 * max_decisions + 2)
-        expected = frozenset(
-            w for w in self.bridge_words().split()
-            if w.isascii() and w.isalpha() and w.isupper() and 2 <= len(w) <= 15
-        )
-        if self.env.words != expected:
-            self.env.close()
-            raise ValueError("Java and Quackle dictionaries differ; rebuild both engines")
+        if bridge is not None and word_list is not None:
+            raise ValueError("Specify bridge or word_list, not both")
+        self.bridge = bridge if bridge is not None else QuackleBridge(word_list=word_list)
+        if self.bridge.lexicon is not None:
+            self.env = ScrabbleEnv(word_list=self.bridge.word_list, max_turns=2 * max_decisions + 2)
+        else:
+            self.env = ScrabbleEnv(max_turns=2 * max_decisions + 2)
+            expected = frozenset(
+                w for w in self.bridge_words().split()
+                if w.isascii() and w.isalpha() and w.isupper() and 2 <= len(w) <= 15
+            )
+            if self.env.words != expected:
+                self.env.close()
+                raise ValueError("Java and Quackle dictionaries differ; rebuild both engines")
         self.max_decisions = max_decisions
         self.learner = 0
         self.decisions = 0

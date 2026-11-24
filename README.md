@@ -439,8 +439,10 @@ The default lexicon comes from the JAR's licensed demo dictionary, restricted to
 teaching lexicon in your basic example or another appropriately licensed list,
 pass `word_list=...`, or use `words={"AT", "CAT", ...}`. Files accept
 whitespace-separated ASCII words and full-line `#` comments, uppercase entries,
-remove duplicates, and reject invalid tokens. The `words=` API requires uppercase
-already.
+remove duplicates, and reject invalid tokens. A ZIP containing exactly one `.txt`
+lexicon is also accepted without extracting archive paths. WGPO hook tables with
+a `//Word` tab-separated header use only the first (word) column; hooks and
+statistics are not vocabulary. The `words=` API requires uppercase already.
 
 JPype shares one JVM per Python process. `close()` releases this environment's
 game references but deliberately does **not** shut down the JVM, so other
@@ -484,10 +486,39 @@ This writes `target/dqn/checkpoint.pt`, `policy.json` for browser inference,
 and per-episode `training.jsonl`. It is **not enough training to produce a
 competitive opponent**. Fresh training refuses to overwrite an existing
 checkpoint: use `--resume` to continue or choose a separate `--output` directory.
-For example, continue an existing smoke checkpoint for another 1,000 episodes:
+The schema-3 score-prior network is incompatible with older five-bit/64-32 and
+schema-2 checkpoints: start a fresh output directory rather than resuming those weights.
+
+For a longer experiment with a locally supplied dictionary, using five parallel
+actor processes (each runs its own Java engine and Quackle; ~0.5 GB RAM each):
 
 ```powershell
-.\.venv\Scripts\python.exe -m scrabble_gym.train_dqn --resume target\dqn\checkpoint.pt --episodes 1000
+.\.venv\Scripts\python.exe -m scrabble_gym.train_dqn --word-list WOW24v3.zip --episodes 3000 --workers 5 --threads 4 --output target\dqn-wow24
+```
+
+The supplied `WOW24v3.zip` identifies itself as **WGPO Official Words 2024
+(WOW24)** from wordgameplayers.org, not NWL2023. It contains **195,383 unique
+2..15-letter words**. Its notice permits non-profit use and sharing; preserve
+the archive's notice and check its terms for your use. The user-supplied ZIP is
+Git-ignored, not bundled or downloaded by this project. Both Java validation and
+native Quackle use the selected vocabulary; a separate native DAWG is cached
+under Git-ignored `target/quackle/lexicons/`, using temporary normalized words.
+The shared demo dictionary and its native DAWG are not replaced.
+
+Rebuild the native bridge after upgrading the code (`python -m
+scrabble_gym.quackle_build`) so it supports selecting the generated DAWG.
+`--word-list` must be supplied again for resume and evaluation; its SHA-256 must
+match the checkpoint. Plain authorized NWL2023 word-list files are supported too.
+
+Training defaults to **3,000 additional episodes**, a 500-decision replay warmup,
+batch size 64, learning rate `0.00025`, `gamma=0.97`, and one minibatch update
+every two learner decisions (`--train-every`). With `--workers N`, actors play
+games with the latest published weights while the main process learns; one
+actor plays each game end to end. `--time-limit-seconds` stops after complete
+episodes and saves a checkpoint/export. Resume the resulting model:
+
+```powershell
+.\.venv\Scripts\python.exe -m scrabble_gym.train_dqn --word-list WOW24v3.zip --resume target\dqn-wow24\checkpoint.pt --episodes 1000 --workers 5
 ```
 
 `--episodes` means additional episodes, not the desired total. Training alternates
@@ -499,56 +530,147 @@ PyTorch CUDA installation/GPU. Candidate enumeration and Quackle still run on CP
 Evaluate without exploration or weight/replay updates on held-out seeds:
 
 ```powershell
-.\.venv\Scripts\python.exe -m scrabble_gym.train_dqn --evaluate target\dqn\checkpoint.pt --episodes 100 --seed 100000
+.\.venv\Scripts\python.exe -m scrabble_gym.train_dqn --word-list WOW24v3.zip --evaluate target\dqn-wow24\checkpoint.pt --episodes 200 --seed 100000 --workers 5 --output target\dqn-wow24-comparison
+.\.venv\Scripts\python.exe -m scrabble_gym.train_dqn --word-list WOW24v3.zip --baseline untrained --episodes 200 --seed 100000 --workers 5 --output target\dqn-wow24-comparison
+.\.venv\Scripts\python.exe -m scrabble_gym.train_dqn --word-list WOW24v3.zip --baseline greedy --episodes 200 --seed 100000 --workers 5 --output target\dqn-wow24-comparison
 ```
 
-Evaluation appends `evaluation.jsonl` beside the checkpoint. Each episode logs
+Evaluation plays each seed in **both learner seats** (use an even episode count).
+Use identical dictionary, seeds, episode counts and turn limits for all three
+commands. The untrained baseline is a fresh network initialized with
+`--baseline-network-seed` (default 42); match the original training seed for
+a controlled before/after comparison. Because the residual output starts at zero,
+the untrained DQN plays the highest-scoring move in its acting set, so training
+must beat score-greedy play to show improvement. `--seed` selects held-out game seeds.
+Greedy maximizes immediate score, otherwise exchanges the largest subset or
+passes. All face the same fixed Quackle policy. Evaluation refuses seeds that
+overlap the checkpoint's training seeds.
+
+Evaluation appends `evaluation.jsonl` beside the checkpoint unless `--output`
+is specified; baselines write `untrained.jsonl` and `greedy.jsonl`. Each episode logs
 scores, learner seat, score differential, reward, natural termination/truncation,
 and runtime; training also logs epsilon, replay size, updates and mean Huber loss.
-The summary reports win rate **only for naturally completed games**, excluding
-ties from wins, and separately counts truncations. Avoid evaluation seeds used
-for training. Falling training loss alone is not evidence of stronger play.
+Summary JSON files report win rate with a 95% Wilson interval, mean score
+difference and its standard error, ties, per-seat game/win counts, and truncations.
+Win rate and score-difference statistics include **only naturally completed
+games**; ties are not wins. The Wilson interval treats games as independent;
+for formal significance testing, use seed-level paired analysis because the two
+seats share a seed. Compare held-out score difference and wins against both
+baselines, not training loss alone. Small pilots or 20-game evaluations are
+diagnostic, not sufficient to establish competitive strength.
+
+### WOW24 CPU experiment
+
+The schema-3 run uses the supplied WOW24 archive, initialization seed 42,
+five actor processes, a 500-decision warmup, and one optimizer update per
+learner decision (`--train-every 1`). It completed **2,000 training games and
+25,254 optimizer updates** within a 12,600-second episode-boundary budget.
+Its checkpoint is `target/dqn-wow24/checkpoint.pt`; the training summary is
+`target/dqn-wow24/training-summary.json`.
+
+Matched evaluation uses seeds 100000..100049, both seats per seed, for 100
+games per policy against the same fixed Quackle opponent. Training score
+improvements alone do not demonstrate improvement over the baselines.
+
+The full-horizon (`gamma=0.97`) checkpoint produced:
+
+| Policy | Wins against Quackle | Mean score difference |
+| --- | ---: | ---: |
+| Untrained score-prior DQN | 39/100 | -32.54 |
+| DQN after 2,000 training games | 10/100 | -127.47 |
+| Immediate-score Greedy | 39/100 | -32.54 |
+
+All games ended naturally. The untrained and Greedy baselines coincide here
+because the untrained residual is zero. The trained DQN's paired score gain
+relative to Greedy was **-94.93 points** (95% seed-cluster bootstrap interval
+approximately **[-120, -70]**). **This checkpoint regressed, rather than improving
+on either baseline, and must not be presented as a competitive opponent.**
+The summaries, invocation configuration and paired analysis are saved locally
+in `target/dqn-wow24-comparison/comparison.json`.
+
+A bounded shorter-horizon experiment resumes this checkpoint's existing replay,
+sets `gamma=0.5` and learning rate `0.0001`, synchronizes the target to the online
+network, and performs 1,500 further minibatch updates (batch size 64). It collects
+**no additional training games**: its totals are 2,000 games and 26,754 updates.
+Its checkpoint/export and exact configuration are under
+`target/dqn-wow24-short-horizon/`. A separate 40-game diagnostic on seeds
+200000..200019 yielded 12 wins and a -77.875 mean score difference; that sample
+alone is not a matched improvement claim. The full matched evaluation is saved
+under `target/dqn-wow24-comparison-short-horizon/`.
+
+On the same 100 benchmark games, the refit won **16 games**, tied one, and had
+a **-93.92** mean score difference. Its paired gain over the original trained
+checkpoint was +33.55 points (95% seed-cluster interval [10.68, 56.12]), but its
+gain over Greedy remained **-61.38** (interval [-84.16, -38.52]). This bounded
+correction reduced the regression; **neither trained model surpassed the
+baselines**. Both comparisons and the refit configuration are included in
+`target/dqn-wow24-comparison/comparison.json`. More training episodes and richer
+features did not, in this experiment, establish a competitive learned policy.
 
 ### Learning semantics
 
-- The variable action set contains **all generated legal physical placements**,
-  every allowed nonempty exchange multiset, and pass. There is no top-k cutoff.
+- The generated legal set contains **all legal physical placements**, every
+  allowed nonempty exchange multiset, and pass. The DQN acts, explores and takes
+  its Bellman max over **up to 64 legal moves, including pass**: start with the
+  highest-scoring candidates and replace the last with pass if necessary
+  (`--top-candidates`, stored in the checkpoint and `policy.json`; the browser
+  applies the same cut). Without this cut, argmax over thousands of rarely sampled
+  moves picked low-scoring outliers with unconstrained Q extrapolations.
   A shared scalar Q-network scores each `(observation, candidate)`; candidate
   indices are never treated as persistent action identities.
 - One learner transition includes its move **and Quackle's response**, unless
   the learner ends the game. Next-state maximization therefore always uses the
   learner's next rack and legal moves, never Quackle's rack/perspective.
 - Reward is the change in `(learner score - opponent score) / 100` across that
-  round, including final rack penalties/bonuses. Discount `gamma=0.99` applies
+  round, including final rack penalties/bonuses. Discount `gamma=0.97` applies
   once per learner decision, not once per individual player's turn.
 - Targets are
   `r + gamma * Q_target(s', argmax_legal Q_online(s', action))`.
   Natural terminals have no bootstrap. `--max-decisions` (default 100) truncates
   only after a complete round and retains a learner-state bootstrap; truncated
   games are not recorded as wins.
-- The network is an MLP with hidden layers 64/32 and ReLU. Features encode
-  each board/placement square as five letter-identity bits plus a separate
-  physical-blank flag, own rack/leave/exchanged counts, public scores, opponent
+- `Q(s, a) = score(a)/100 + residual(s, a)`: the immediate score is a fixed
+  prior and the network learns only the correction (leave value, board
+  openings, opponent reply), like Quackle's score-plus-leave valuation. The
+  residual's output layer is zero-initialized.
+- The residual is an MLP with hidden layers **256/128/64** and ReLU. Each
+  board/placement square has **35 features**: 26 one-hot letter channels,
+  a physical-blank flag, normalized row/column coordinates, four directional
+  neighbor-occupancy channels (north/south/west/east, with no edge wrap), and
+  word/letter premium bonuses. Coordinates and premium bonuses are attached to
+  occupied/placed squares; empty squares have no letter channel. Adjacent squares
+  are thus explicitly related in the input, rather than only arbitrary positions
+  in a flattened five-bit vector. This is **not a CNN** and does not enforce
+  translation-invariant learned filters. Inputs also include own
+  rack/leave/exchanged counts, public scores, opponent
   rack **size**, bag **count**, scoreless turns, action kind and immediate score.
   It never sees hidden racks or bag contents. This is a feed-forward,
   partially-observed baseline, not a recurrent belief-state Scrabble solver.
 - Adam, Huber loss and gradient clipping update the online network. The target
-  network stays frozen and synchronizes every 100 optimizer updates by default.
-  Epsilon decays from 1.0 to 0.05 over 10,000 learner decisions.
-- Replay is capped by both 5,000 transitions and 128 MiB of NumPy payload
+  network stays frozen and synchronizes every 250 optimizer updates by default.
+  Epsilon decays from 1.0 to 0.05 over 10,000 learner decisions (about 700
+  games). 80% of exploratory moves (`--focused-exploration`) sample one of the
+  10 highest-scoring candidates; the rest are uniform over the acting set.
+- Replay is capped by both 5,000 transitions and 384 MiB of NumPy payload
   (Python/container overhead is additional). Compact legal candidates are stored,
-  while Q evaluation runs in chunks. Old transitions are evicted as needed.
+  while Q evaluation reuses the state projection and multiplies sparse candidate
+  features in the first layer; a minibatch's Bellman targets are computed in one
+  batched sparse product per network. Old transitions are evicted as needed.
   `--replay-capacity`, `--replay-mb`, `--batch-size` and `--warmup` adjust these
   limits; a single transition exceeding the memory budget fails explicitly.
 
-Checkpoints are saved atomically at completed episode boundaries and retain
+Checkpoints are saved atomically every 100 completed episodes
+(`--checkpoint-every`) and when the run ends, and retain
 online/target weights, optimizer, replay, counters and random-generator states.
-Resume restores these and the checkpoint's gamma, learning rate and target
-interval. Exploration/replay limits remain command-line settings; keep them
+Resume restores these and the checkpoint's gamma, learning rate, target
+interval and top-candidate count. Exploration/replay limits remain command-line settings; keep them
 consistent for reproducible continuation. Dictionary hash and Quackle revision
 are checked; rebuild/retrain rather than silently mixing incompatible data.
 Only load checkpoints you trust, even though loading uses PyTorch `weights_only`.
-Generated checkpoints/logs stay in Git-ignored `target/`.
+Generated checkpoints/logs stay in Git-ignored `target/`. `runs.jsonl` records
+each training invocation's arguments, dictionary hash and opponent revision.
+An interrupted run can lose progress since the last completed save; a normal
+time-budget stop saves at the next episode boundary.
 
 ### Play the exported network
 
@@ -559,6 +681,9 @@ Run the local Quackle server and open http://127.0.0.1:8766/:
 ```
 
 The server serves `target/dqn/policy.json`; refresh the page after training.
+It uses the shared demo dictionary and rejects models trained on other
+vocabularies. The WOW24 experiment remains a Python training/evaluation model;
+copying its export into the demo model location does not make it compatible.
 Choose **DQN** in **Play against agent** or on either side of **Agents vs agents**.
 The UI shows the model's training episode/update count, without promising
 strength. Checkpoints with zero optimizer updates stay disabled.
@@ -572,7 +697,12 @@ reload uses the current exported model.
 DQN remains disabled on GitHub Pages/ordinary static servers or with a
 missing/mismatched model. A checkpoint in another output directory must be
 explicitly exported/copied to `target/dqn/policy.json` for this local UI.
-The lexicon remains the shared non-tournament demonstration lexicon.
+The browser still uses its bundled demonstration dictionary. A model trained
+on WOW24/NWL2023 is intentionally unavailable there. Plain-text training sources
+would require the same appropriately licensed word-list bytes in the browser;
+archive-trained models additionally require archive loading/hash support that
+the current browser does not implement. Copying a normalized ZIP vocabulary to
+the browser alone will not satisfy the source-file hash check.
 
 ## Dictionary data
 
@@ -586,6 +716,12 @@ docs/CMUDICT-LICENSE.txt
 ```
 
 The dictionary implementation is replaceable through the `WordValidator` abstraction.
+
+For North American tournament experiments, NASPA's
+[NWL2023](https://www.scrabbleplayers.org/w/NWL2023) is a licensed tournament
+lexicon, distinct from the CMU demo data and the supplied WGPO WOW24 list.
+Obtain authorized access through NASPA and provide your local file using
+`--word-list`; this project does not fetch or redistribute NWL2023.
 
 ## Deployment
 

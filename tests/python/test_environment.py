@@ -2,6 +2,7 @@ import itertools
 from pathlib import Path
 import tempfile
 import unittest
+from zipfile import ZipFile
 
 import gymnasium as gym
 from gymnasium.utils.env_checker import check_env
@@ -9,10 +10,39 @@ import numpy as np
 
 import scrabble_gym
 from scrabble_gym import Move, ScrabbleEnv, greedy_action
-from scrabble_gym.environment import ALPHABET
+from scrabble_gym.environment import ALPHABET, load_words
 
 
 PAIRS = frozenset(a + b for a, b in itertools.product(ALPHABET[:-1], repeat=2))
+
+
+class LexiconLoadingTest(unittest.TestCase):
+    def test_wgpo_zip_reads_word_column_not_hooks_or_statistics(self):
+        text = ("\ufeff//Lexicon Name: synthetic test\n"
+                "//Word\tFrontHooks\tBackHooks\tInnerFront\n"
+                "AT\t bc\t s\tFalse\nCAT\t s\t s\tTrue\n")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "words.zip"
+            with ZipFile(path, "w") as archive:
+                archive.writestr("nested/words.txt", text)
+            self.assertEqual(load_words(path), {"AT", "CAT"})
+            self.assertEqual(list(Path(directory).iterdir()), [path])
+
+    def test_rejects_ambiguous_archives_malformed_rows_and_bad_words(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "words.zip"
+            for entries in (
+                {"a.txt": "AT", "b.txt": "CAT"},
+                {"a.csv": "AT"},
+                {"a.txt": "//Word\tFrontHooks\nAT\n"},
+                {"a.txt": "//Word\tFrontHooks\nA1\t x\n"},
+            ):
+                with self.subTest(entries=entries):
+                    with ZipFile(path, "w") as archive:
+                        for name, text in entries.items():
+                            archive.writestr(name, text)
+                    with self.assertRaises(ValueError):
+                        load_words(path)
 
 
 class PassOnly(gym.ActionWrapper):

@@ -9,11 +9,13 @@ import logging
 import math
 from pathlib import Path
 import subprocess
+from tempfile import TemporaryDirectory
 import threading
 from urllib.parse import urlsplit
 
 from .build import ROOT
-from .quackle_build import TARGET
+from .quackle_build import TARGET, build_lexicon
+from .environment import load_words
 
 
 LOG = logging.getLogger(__name__)
@@ -105,7 +107,7 @@ def parse_action(output: str, position: dict) -> dict:
 
 
 class QuackleBridge:
-    def __init__(self):
+    def __init__(self, *, word_list: Path | None = None):
         manifest_path = TARGET / "manifest.json"
         if not manifest_path.is_file():
             raise FileNotFoundError("Run python -m scrabble_gym.quackle_build first")
@@ -113,11 +115,27 @@ class QuackleBridge:
         self.executable = (ROOT / self.manifest["executable"]).resolve()
         if not self.executable.is_relative_to(TARGET.resolve()) or not self.executable.is_file():
             raise FileNotFoundError("Native bridge executable is missing or outside target/quackle")
+        self.word_list = Path(word_list).resolve() if word_list is not None else DOCS / "words.txt"
+        self.lexicon = None
+        if word_list is not None:
+            digest = hashlib.sha256(self.word_list.read_bytes()).hexdigest()
+            words = load_words(self.word_list)
+            directory = TARGET / "lexicons" / digest
+            directory.mkdir(parents=True, exist_ok=True)
+            self.lexicon = directory / "words.dawg"
+            if not self.lexicon.is_file():
+                with TemporaryDirectory(dir=directory) as temporary:
+                    source = Path(temporary) / "words.txt"
+                    source.write_text("\n".join(sorted(words)) + "\n", encoding="utf-8")
+                    dawg = Path(temporary) / "words.dawg"
+                    build_lexicon(source, dawg)
+                    dawg.replace(self.lexicon)
+            self.manifest = {**self.manifest, "dictionary_sha256": digest, "words": len(words)}
         self._lock = threading.BoundedSemaphore(1)
         self.check_dictionary()
 
     def check_dictionary(self) -> None:
-        digest = hashlib.sha256((DOCS / "words.txt").read_bytes()).hexdigest()
+        digest = hashlib.sha256(self.word_list.read_bytes()).hexdigest()
         if digest != self.manifest["dictionary_sha256"]:
             raise RuntimeError("Dictionary changed; rebuild Quackle before playing")
 
@@ -128,7 +146,10 @@ class QuackleBridge:
             raise BlockingIOError("Quackle is busy with another request; retry shortly")
         try:
             result = subprocess.run(
-                [str(self.executable)], input=f"{cells}\n{rack}\n{bag_size}\n",
+                [str(self.executable)] + (
+                    [] if self.lexicon is None else [str(self.lexicon.relative_to(ROOT))]
+                ),
+                input=f"{cells}\n{rack}\n{bag_size}\n",
                 cwd=ROOT, capture_output=True, text=True, encoding="utf-8",
                 errors="replace", timeout=20, check=False,
             )
@@ -205,7 +226,7 @@ class Handler(SimpleHTTPRequestHandler):
             try:
                 model = json.loads(POLICY.read_text(encoding="utf-8"))
                 digest = hashlib.sha256((DOCS / "words.txt").read_bytes()).hexdigest()
-                if (model.get("schema") != 1 or model.get("dictionary_sha256") != digest
+                if (model.get("schema") != 3 or model.get("dictionary_sha256") != digest
                         or model.get("episodes", 0) < 1 or model.get("updates", 0) < 1):
                     raise ValueError("DQN checkpoint is incompatible, has no learning updates, or uses another dictionary")
                 self._json(200, model)

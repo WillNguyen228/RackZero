@@ -15,17 +15,53 @@ from torch import nn
 from .environment import ALPHABET, DIRECTIONS, ScoredMove
 
 
-SCHEMA = 1
-STATE_SIZE = 15 * 15 * 6 + 27 + 5
-ACTION_SIZE = 15 * 15 * 6 + 27 * 2 + 3 + 1
-HIDDEN = (64, 32)
+SCHEMA = 3
+CELL_SIZE = 35
+STATE_SIZE = 15 * 15 * CELL_SIZE + 27 + 5
+ACTION_SIZE = 15 * 15 * CELL_SIZE + 27 * 2 + 3 + 1
+HIDDEN = (256, 128, 64)
+
+
+def _square_features():
+    rows, cols = np.indices((15, 15))
+    layout = np.stack((rows / 14, cols / 14, np.zeros_like(rows),
+                       np.zeros_like(rows)), axis=-1).astype(np.float32)
+    premiums = {
+        (3, 0): [(0, 0), (0, 7), (0, 14), (7, 0), (7, 14), (14, 0), (14, 7), (14, 14)],
+        (2, 0): [(i, j) for n in range(1, 5)
+                 for i, j in ((n, n), (n, 14-n), (14-n, n), (14-n, 14-n))] + [(7, 7)],
+        (3, 1): [(1, 5), (1, 9), (5, 1), (5, 5), (5, 9), (5, 13),
+                 (9, 1), (9, 5), (9, 9), (9, 13), (13, 5), (13, 9)],
+        (2, 1): [(0, 3), (0, 11), (2, 6), (2, 8), (3, 0), (3, 7), (3, 14),
+                 (6, 2), (6, 6), (6, 8), (6, 12), (7, 3), (7, 11), (8, 2),
+                 (8, 6), (8, 8), (8, 12), (11, 0), (11, 7), (11, 14),
+                 (12, 6), (12, 8), (14, 3), (14, 11)],
+    }
+    for (multiplier, letter), squares in premiums.items():
+        for row, col in squares:
+            layout[row, col, 3 if letter else 2] = (multiplier - 1) / 2
+    return layout
+
+
+SQUARE_FEATURES = _square_features()
 
 
 def board_features(cells: np.ndarray) -> np.ndarray:
-    """Five letter-identity bits plus a separate assigned-blank bit per square."""
-    letters = np.where(cells > 26, cells - 26, cells)
-    bits = ((letters[..., None] >> np.arange(5)) & 1).astype(np.float32)
-    return np.concatenate((bits, (cells > 26)[..., None]), axis=-1).reshape(*cells.shape[:-1], -1)
+    """One-hot letters, blanks, coordinates, N/S/W/E occupancy and premiums."""
+    grid = cells.reshape(*cells.shape[:-1], 15, 15)
+    letters = np.where(grid > 26, grid - 26, grid)
+    occupied = grid != 0
+    neighbors = np.zeros((*grid.shape, 4), dtype=np.float32)
+    neighbors[..., 1:, :, 0] = occupied[..., :-1, :]
+    neighbors[..., :-1, :, 1] = occupied[..., 1:, :]
+    neighbors[..., :, 1:, 2] = occupied[..., :, :-1]
+    neighbors[..., :, :-1, 3] = occupied[..., :, 1:]
+    squares = SQUARE_FEATURES * occupied[..., None]
+    features = np.concatenate((
+        (letters[..., None] == np.arange(1, 27)).astype(np.float32),
+        (grid > 26)[..., None], squares[..., :2], neighbors, squares[..., 2:],
+    ), axis=-1)
+    return features.reshape(*cells.shape[:-1], -1)
 
 
 def encode_state(observation: dict) -> np.ndarray:
@@ -87,8 +123,25 @@ class Candidates:
         ), axis=-1)
 
     def take(self, index: int):
-        return Candidates(*(getattr(self, name)[index:index + 1].copy()
+        return self.subset([index])
+
+    def subset(self, indexes):
+        return Candidates(*(getattr(self, name)[indexes].copy()
                             for name in ("cells", "leave", "exchange", "kinds", "scores")))
+
+    def top(self, count: int | None):
+        """Highest-scoring candidates plus pass: the DQN's acting and Bellman max set."""
+        keep = self.top_indexes(count)
+        return self if keep is None else self.subset(keep)
+
+    def top_indexes(self, count: int | None):
+        if count is None or len(self) <= count:
+            return None
+        order = np.lexsort((self.kinds, -self.scores))[:count]
+        passes = np.flatnonzero(self.kinds == 2)
+        if len(passes) and passes[0] not in order:
+            order[-1] = passes[0]
+        return np.sort(order)
 
     def tensors(self):
         return {name: torch.from_numpy(getattr(self, name))
@@ -106,15 +159,24 @@ class Candidates:
 
 
 class QNetwork(nn.Module):
+    """Q = immediate move score / 100 (the action's last feature) + learned residual.
+
+    The residual starts at zero, so an untrained network ranks moves by score;
+    Bellman updates learn leave, defensive and future value on top of it.
+    """
+
     def __init__(self):
         super().__init__()
         self.layers = nn.Sequential(
             nn.Linear(STATE_SIZE + ACTION_SIZE, HIDDEN[0]), nn.ReLU(),
-            nn.Linear(HIDDEN[0], HIDDEN[1]), nn.ReLU(), nn.Linear(HIDDEN[1], 1),
+            nn.Linear(HIDDEN[0], HIDDEN[1]), nn.ReLU(),
+            nn.Linear(HIDDEN[1], HIDDEN[2]), nn.ReLU(), nn.Linear(HIDDEN[2], 1),
         )
+        nn.init.zeros_(self.layers[-1].weight)
+        nn.init.zeros_(self.layers[-1].bias)
 
     def forward(self, states, actions):
-        return self.layers(torch.cat((states, actions), dim=-1)).squeeze(-1)
+        return self.layers(torch.cat((states, actions), dim=-1)).squeeze(-1) + actions[..., -1]
 
 
 @dataclass
@@ -158,7 +220,7 @@ class Replay:
 
 class DoubleDQN:
     def __init__(self, *, seed=42, learning_rate=0.001, gamma=0.99, target_interval=100,
-                 device="cpu", replay_capacity=5000, replay_mb=128):
+                 device="cpu", replay_capacity=5000, replay_mb=128, top_candidates=None):
         if (not 0 <= gamma <= 1 or target_interval < 1
                 or not math.isfinite(learning_rate) or learning_rate <= 0):
             raise ValueError("Invalid DQN hyperparameters")
@@ -178,16 +240,27 @@ class DoubleDQN:
         self.episodes = 0
         self.seed = seed
         self.learning_rate = learning_rate
+        self.top_candidates = top_candidates
         self.opponent_revision = ""
 
+    @staticmethod
+    def _split(network):
+        first = network.layers[0]
+        return (first.weight[:, :STATE_SIZE].contiguous(),
+                first.weight[:, STATE_SIZE:].t().contiguous(), first.bias, network.layers[1:])
+
     @torch.no_grad()
-    def values(self, state: np.ndarray, actions: Candidates, *, network=None) -> np.ndarray:
-        network = self.online if network is None else network
+    def values(self, state: np.ndarray, actions: Candidates, *, network=None, split=None) -> np.ndarray:
+        state_weight, action_weight, bias, rest = split or self._split(
+            self.online if network is None else network)
         values = []
+        state_tensor = torch.from_numpy(state).to(self.device)
+        shared = nn.functional.linear(state_tensor, state_weight, bias)
         for start in range(0, len(actions), 256):
             features = torch.from_numpy(actions.features(slice(start, start + 256))).to(self.device)
-            states = torch.from_numpy(state).to(self.device).expand(len(features), -1)
-            values.append(network(states, features).cpu().numpy())
+            # Candidate features are mostly zero; do not repeat the state projection.
+            hidden = torch.sparse.mm(features.to_sparse(), action_weight) + shared
+            values.append((rest(hidden).squeeze(-1) + features[:, -1]).cpu().numpy())
         if not values:
             raise ValueError("Legal candidates must include at least pass")
         result = np.concatenate(values)
@@ -195,26 +268,49 @@ class DoubleDQN:
             raise RuntimeError("Nonfinite Q values")
         return result
 
-    def choose(self, state, actions, epsilon=0.0):
-        if not 0 <= epsilon <= 1:
-            raise ValueError("epsilon must be from 0 to 1")
+    def choose(self, state, actions, epsilon=0.0, *, focused=0.0):
+        """Epsilon-greedy; a `focused` share of exploration samples the top-10 scoring moves."""
+        if not 0 <= epsilon <= 1 or not 0 <= focused <= 1:
+            raise ValueError("epsilon and focused must be from 0 to 1")
         if epsilon and self.rng.random() < epsilon:
+            if focused and self.rng.random() < focused:
+                best = np.lexsort((actions.kinds, -actions.scores))[:10]
+                return int(best[self.rng.randrange(len(best))])
             return self.rng.randrange(len(actions))
         return int(self.values(state, actions).argmax())
 
     @torch.no_grad()
+    def _batch_values(self, split, states: np.ndarray, groups: list[Candidates]) -> torch.Tensor:
+        """Q for every candidate of every state in one sparse first-layer product."""
+        state_weight, action_weight, bias, rest = split
+        shared = nn.functional.linear(torch.from_numpy(states).to(self.device), state_weight, bias)
+        owners = torch.repeat_interleave(torch.arange(len(groups), device=self.device),
+                                         torch.tensor([len(g) for g in groups], device=self.device))
+        parts = [torch.from_numpy(g.features(slice(None))).to_sparse() for g in groups]
+        hidden = torch.sparse.mm(torch.cat(parts).to(self.device), action_weight) + shared[owners]
+        prior = torch.from_numpy(np.concatenate([g.scores for g in groups]) / 100).to(self.device)
+        return rest(hidden).squeeze(-1) + prior
+
+    @torch.no_grad()
     def bellman_targets(self, batch: list[Transition]) -> torch.Tensor:
-        values = []
-        for transition in batch:
-            future = 0.0
-            if not transition.terminated:
-                if transition.next_actions is None:
-                    raise ValueError("Nonterminal replay needs next legal actions")
-                best = self.choose(transition.next_state, transition.next_actions)
-                future = float(self.values(transition.next_state,
-                               transition.next_actions.take(best), network=self.target)[0])
-            values.append(transition.reward + self.gamma * future)
-        return torch.tensor(values, dtype=torch.float32, device=self.device)
+        rewards = torch.tensor([t.reward for t in batch], dtype=torch.float32, device=self.device)
+        live = [i for i, t in enumerate(batch) if not t.terminated]
+        if any(batch[i].next_actions is None for i in live):
+            raise ValueError("Nonterminal replay needs next legal actions")
+        if not live:
+            return rewards
+        states = np.stack([batch[i].next_state for i in live])
+        groups = [batch[i].next_actions for i in live]
+        online = self._batch_values(self._split(self.online), states, groups)
+        if not torch.all(torch.isfinite(online)):
+            raise RuntimeError("Nonfinite Q values")
+        chosen, start = [], 0
+        for group in groups:
+            chosen.append(group.take(int(online[start:start + len(group)].argmax())))
+            start += len(group)
+        future = self._batch_values(self._split(self.target), states, chosen)
+        rewards[live] += self.gamma * future
+        return rewards
 
     def learn(self, batch_size=32):
         if len(self.replay) < batch_size:
@@ -243,6 +339,7 @@ class DoubleDQN:
             "online": self.online.state_dict(), "target": self.target.state_dict(),
             "optimizer": self.optimizer.state_dict(), "gamma": self.gamma,
             "target_interval": self.target_interval, "learning_rate": self.learning_rate,
+            "top_candidates": self.top_candidates,
             "updates": self.updates, "decisions": self.decisions, "episodes": self.episodes,
             "seed": self.seed, "rng": self.rng.getstate(), "torch_rng": torch.get_rng_state(),
             "opponent_revision": self.opponent_revision,
@@ -263,7 +360,8 @@ class DoubleDQN:
         if data["schema"] != SCHEMA or data["dictionary_sha256"] != dictionary_sha256:
             raise ValueError("Incompatible checkpoint schema or dictionary; do not reuse this model")
         agent = cls(seed=data["seed"], learning_rate=data["learning_rate"], gamma=data["gamma"],
-                    target_interval=data["target_interval"], device=device, **kwargs)
+                    target_interval=data["target_interval"], device=device,
+                    top_candidates=data.get("top_candidates"), **kwargs)
         agent.online.load_state_dict(data["online"])
         agent.target.load_state_dict(data["target"])
         agent.optimizer.load_state_dict(data["optimizer"])
@@ -288,6 +386,7 @@ class DoubleDQN:
             "algorithm": "Double DQN", "opponent": "Quackle static score-plus-leave",
             "opponent_revision": self.opponent_revision,
             "episodes": self.episodes, "updates": self.updates,
+            "top_candidates": self.top_candidates,
             "state_size": STATE_SIZE, "action_size": ACTION_SIZE,
             "layers": [{"weight": layer.weight.detach().cpu().tolist(),
                         "bias": layer.bias.detach().cpu().tolist()} for layer in layers],
@@ -298,6 +397,6 @@ class DoubleDQN:
         temporary.replace(path)
 
 
-def dictionary_hash() -> str:
+def dictionary_hash(word_list: Path | None = None) -> str:
     from .quackle_server import DOCS
-    return hashlib.sha256((DOCS / "words.txt").read_bytes()).hexdigest()
+    return hashlib.sha256((word_list or DOCS / "words.txt").read_bytes()).hexdigest()

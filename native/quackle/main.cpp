@@ -16,8 +16,9 @@
 #include "lexiconparameters.h"
 #include "strategyparameters.h"
 
-int main() {
+int main(int argc, char* argv[]) {
     try {
+        if (argc > 2) throw std::runtime_error("Expected at most one lexicon path");
         std::string cells, rackText;
         int bagSize;
         if (!(std::cin >> cells >> rackText >> bagSize) || cells.size() != 225
@@ -52,7 +53,7 @@ int main() {
         data.setBoardParameters(layout);
         data.setAppDataDirectory("third_party/quackle/data");
         data.setUserDataDirectory("target/quackle");
-        data.lexiconParameters()->loadDawg("target/quackle/demo.dawg");
+        data.lexiconParameters()->loadDawg(argc == 2 ? argv[1] : "target/quackle/demo.dawg");
         if (!data.lexiconParameters()->hasDawg())
             throw std::runtime_error("Demo lexicon not built");
         data.strategyParameters()->initialize("default_english");

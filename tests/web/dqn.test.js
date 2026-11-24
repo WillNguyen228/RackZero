@@ -3,14 +3,15 @@ import assert from "node:assert/strict";
 
 import { createCandidateGenerator } from "../../docs/agents.js";
 import {
-  ACTION_SIZE, STATE_SIZE, createDQNAgent, encodeAction, encodeState, validateModel
+  ACTION_SIZE, CELL_SIZE, STATE_SIZE, createDQNAgent, encodeAction, encodeState, topCandidates,
+  validateModel
 } from "../../docs/dqn.js";
 import { analyzeMove, createAssignedBlank, createGameState, createTile } from "../../docs/engine.js";
 
 function model() {
-  const sizes = [STATE_SIZE + ACTION_SIZE, 64, 32, 1];
+  const sizes = [STATE_SIZE + ACTION_SIZE, 256, 128, 64, 1];
   return {
-    schema: 1, dictionary_sha256: "a".repeat(64), episodes: 2, updates: 3,
+    schema: 3, dictionary_sha256: "a".repeat(64), episodes: 2, updates: 3,
     state_size: STATE_SIZE, action_size: ACTION_SIZE,
     layers: sizes.slice(1).map((output, i) => ({
       weight: Array.from({ length: output }, () => Array(sizes[i]).fill(0)),
@@ -45,7 +46,11 @@ test("DQN feature schema preserves physical blanks, rack leave and public perspe
   state.board[7][7] = createAssignedBlank("Z");
   const s = encodeState(state);
   assert.equal(s.length, STATE_SIZE);
-  assert.equal(s[112 * 6 + 5], 1);
+  assert.equal(s[112 * CELL_SIZE + 26], 1);
+  assert.deepEqual(s.slice(112 * CELL_SIZE, 112 * CELL_SIZE + 26),
+    [...Array(25).fill(0), 1]);
+  assert.equal(s[113 * CELL_SIZE + 31], 1);
+  assert.equal(s[112 * CELL_SIZE + 33], 0.5);
   assert.deepEqual(s.slice(-5), [0.01, 0.02, 0.86, 1, 0]);
   const action = {
     kind: "place", score: 2,
@@ -53,8 +58,8 @@ test("DQN feature schema preserves physical blanks, rack leave and public perspe
   };
   const a = encodeAction(state, action);
   assert.equal(a.length, ACTION_SIZE);
-  assert.equal(a[113 * 6 + 5], 1);
-  assert.equal(a[1350 + 26], 0);
+  assert.equal(a[113 * CELL_SIZE + 26], 1);
+  assert.equal(a[225 * CELL_SIZE + 26], 0);
   assert.equal(a.at(-1), 0.02);
 });
 
@@ -63,6 +68,7 @@ test("DQN chooses by learned Q values across legal moves, not changing action in
   weights.layers[0].weight[0][STATE_SIZE + ACTION_SIZE - 1] = 1;
   weights.layers[1].weight[0][0] = 1;
   weights.layers[2].weight[0][0] = 1;
+  weights.layers[3].weight[0][0] = 1;
   const words = new Set(["AT", "CAT"]);
   const state = position();
   const action = createDQNAgent(words, weights)(state);
@@ -71,14 +77,25 @@ test("DQN chooses by learned Q values across legal moves, not changing action in
   engine.board = state.board;
   engine.players[0].rack = state.rack;
   assert.equal(analyzeMove(engine, action.placements, words).score, action.score);
-  assert.ok(Math.abs(action.qValue - action.score / 100) < 1e-6);
+  assert.ok(Math.abs(action.qValue - 2 * action.score / 100) < 1e-6);
+});
+
+test("DQN acts over the highest-scoring moves and always keeps pass", () => {
+  const actions = [
+    { kind: "place", score: 5 }, { kind: "place", score: 9 }, { kind: "place", score: 1 },
+    { kind: "exchange" }, { kind: "pass" }
+  ];
+  assert.deepEqual(topCandidates(actions, 3), [actions[0], actions[1], actions[4]]);
+  assert.equal(topCandidates(actions, null), actions);
+  assert.throws(() => validateModel({ ...model(), top_candidates: 0 }));
+  assert.ok(validateModel({ ...model(), top_candidates: 64 }));
 });
 
 test("DQN requires real updates and finite correctly shaped weights", () => {
   const weights = model();
   assert.equal(validateModel(weights), weights);
   for (const patch of [
-    { schema: 2 }, { updates: 0 }, { episodes: 0 }, { dictionary_sha256: "wrong" },
+    { schema: 1 }, { updates: 0 }, { episodes: 0 }, { dictionary_sha256: "wrong" },
     { state_size: STATE_SIZE + 1 }, { layers: [] }
   ]) assert.throws(() => validateModel({ ...weights, ...patch }));
   weights.layers[0].weight[0][0] = NaN;

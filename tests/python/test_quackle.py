@@ -8,6 +8,7 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch
+from zipfile import ZipFile
 
 from scrabble_gym import Move, ScrabbleEnv
 from scrabble_gym.quackle_build import TARGET, build_lexicon
@@ -164,7 +165,7 @@ class QuackleHTTPTest(unittest.TestCase):
                 self.assertEqual(self.request("GET", "/api/dqn/model")[0], 404)
                 policy.write_text("{", encoding="utf-8")
                 self.assertEqual(self.request("GET", "/api/dqn/model")[0], 503)
-                model = {"schema": 1, "dictionary_sha256": hashlib.sha256((DOCS / "words.txt").read_bytes()).hexdigest(),
+                model = {"schema": 3, "dictionary_sha256": hashlib.sha256((DOCS / "words.txt").read_bytes()).hexdigest(),
                          "episodes": 2, "updates": 5}
                 policy.write_text(json.dumps(model), encoding="utf-8")
                 status, body = self.request("GET", "/api/dqn/model")
@@ -177,6 +178,39 @@ class QuackleHTTPTest(unittest.TestCase):
 
 @unittest.skipUnless((TARGET / "manifest.json").is_file(), "Build native Quackle to run integration tests")
 class QuackleNativeTest(unittest.TestCase):
+    def test_local_dictionary_is_shared_without_replacing_demo_data(self):
+        from scrabble_gym.opponents import QuackleMatch, native_move, public_position
+        before = (DOCS / "words.txt").read_bytes()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "licensed-example.zip"
+            with ZipFile(source, "w") as archive:
+                archive.writestr("words.txt", "//Word\tFrontHooks\nat\t c\nCAT\t s\nQI\t \n")
+            bridge = QuackleBridge(word_list=source)
+            with patch("scrabble_gym.quackle_server.build_lexicon",
+                       side_effect=AssertionError("Must not rewrite a lexicon in use")):
+                self.assertEqual(QuackleBridge(word_list=source).lexicon, bridge.lexicon)
+            match = QuackleMatch(bridge=bridge)
+            self.addCleanup(match.close)
+            self.assertEqual(match.env.words, {"AT", "CAT", "QI"})
+            self.assertEqual(bridge.manifest["dictionary_sha256"],
+                             hashlib.sha256(source.read_bytes()).hexdigest())
+            state = position("CAT")
+            action = bridge.choose(state)
+            self.assertEqual(action["kind"], "place")
+            obs, _ = match.env.reset(seed=42)
+            for _ in range(4):
+                public = public_position(obs)
+                action = bridge.choose(public)
+                obs, _, terminated, _, info = match.env.step(native_move(action, public))
+                if action["kind"] == "place":
+                    self.assertEqual(action["score"], info["move_score"])
+                if terminated:
+                    break
+            source.write_text("AT\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "Dictionary changed"):
+                bridge.choose(state)
+        self.assertEqual((DOCS / "words.txt").read_bytes(), before)
+
     def setUp(self):
         self.bridge = QuackleBridge()
 
