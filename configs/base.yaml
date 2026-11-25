@@ -1,0 +1,108 @@
+# Shared defaults for full-dictionary RackZero experiments. Other configs
+# `extends:` this file and override only what they change. Every key is
+# validated: misspelled keys are errors. Paths are relative to the working
+# directory (run from the repository root). See docs/A100_TRAINING.md.
+name: rackzero
+seed: 42
+iterations: 20
+output_root: runs
+dictionary: WOW24v3.zip      # user-supplied; not redistributed (see docs/RACKZERO.md)
+max_turns: 200               # safety cutoff only; truncated games yield no targets
+
+runtime:
+  device: auto               # auto | cpu | cuda
+  threads: 1                 # torch threads in the trainer process
+  precision: fp32            # fp32 | bf16 | fp16 (training autocast, CUDA only)
+  tf32: true
+  deterministic: false
+
+model:
+  arch: resnet               # resnet | cnn | legacy_mlp
+  channels: 64
+  blocks: 6
+  latent: 256
+  rack_dim: 64
+  belief_dim: 64
+  global_dim: 32
+  move_dim: 128
+  policy_hidden: 256
+  value_hidden: 256
+  policy_attention_layers: 0
+  attention_heads: 4
+  dropout: 0.0
+  norm: batch                # batch | group | none
+  value_head: scalar         # scalar (tanh win sign, MSE) | wdl (3-way cross-entropy)
+  margin_head: true
+
+search:
+  method: ismcts             # stochastic | pimc | ismcts | belief | neural_determinization
+  simulations: 32
+  depth: 2
+  candidates: 16             # top-score shortlist (+ pass + largest exchange)
+  exploration: 1.5
+  particles: 32
+  root_noise_alpha: 0.0      # self-play only; 0 = off (original behaviour)
+  root_noise_fraction: 0.0
+  movegen: fast              # fast (bit-identical, cached) | reference
+
+selfplay:
+  games_per_iteration: 32
+  workers: 4                 # parallel CPU processes (0 = in the trainer process)
+  worker_threads: 1
+  inference: local           # local (CPU per worker) | server (batched on trainer device)
+  inference_batch_size: 32
+  inference_max_wait_ms: 2.0
+  inference_precision: fp32
+  temperature: 1.0           # move sampling temperature over visit counts
+  temperature_moves: null    # null = whole game; else plies before final_temperature
+  final_temperature: 0.0
+
+replay:
+  capacity: 100000
+
+training:
+  # Replay ratio: each iteration trains ceil(8 * new_positions / batch_size)
+  # steps, so every generated position is sampled ~8 times over its lifetime
+  # (the original default.yaml implied ~8). steps_per_iteration is then only
+  # the LR-schedule horizon estimate. Set samples_per_position: null for a
+  # fixed step count.
+  samples_per_position: 8.0
+  steps_per_iteration: 60
+  batch_size: 128
+  min_replay: 256
+  optimizer: adam            # adam | adamw | sgd
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  momentum: 0.9
+  lr_schedule: constant      # constant | cosine | step
+  warmup_steps: 0
+  lr_min_factor: 0.1
+  lr_step_size: 1000
+  lr_gamma: 0.5
+  grad_clip: 5.0
+  policy_loss_weight: 1.0
+  value_loss_weight: 1.0
+  margin_loss_weight: 1.0
+  margin_scale: 100.0
+
+arena:
+  mode: monitor              # gate (promote/roll back) | monitor (report only) | off
+  games: 40
+  threshold: 0.55
+  criterion: threshold       # threshold | wilson
+  every: 2
+
+evaluation:
+  every: 2
+  games: 40
+  opponents: [greedy, heuristic]
+  seed: 1000                 # fixed: comparable across iterations and experiments
+
+checkpoint:
+  every: 1
+  archive_replay: false
+
+logging:
+  tensorboard: false
+  hardware_interval: 2.0
+  progress: true

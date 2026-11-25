@@ -35,6 +35,8 @@ __pycache__/
 
 # User-supplied local training lexicon
 /WOW24v3.zip
+/checkpoints/
+/runs/
 
 # Independently licensed upstream source checkouts
 /third_party/quackle/

@@ -1,0 +1,13 @@
+# Medium baseline on one NVIDIA A100: bf16 training on the GPU, self-play on
+# CPU workers (move generation is CPU-bound). Match selfplay.workers to the
+# CPU cores you request (e.g. --cpus-per-task=16 -> workers: 15).
+extends: medium.yaml
+name: gpu
+runtime:
+  device: cuda
+  threads: 4
+  precision: bf16
+selfplay:
+  workers: 15
+logging:
+  tensorboard: false

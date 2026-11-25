@@ -4,11 +4,13 @@ import com.masterchiefproject.scrabble.dictionary.WordValidator;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
+import java.util.Random;
 
 /** Local pass-and-play game coordinator for two to four players. */
 public final class ScrabbleGame {
@@ -47,6 +49,42 @@ public final class ScrabbleGame {
             }
         }
         refillAllRacks();
+    }
+
+    private ScrabbleGame(WordValidator validator, List<Placement> tiles,
+                         String rack0, String rack1, int score0, int score1,
+                         String bagTiles, int player, int scoreless, long seed) {
+        if (player < 0 || player > 1 || scoreless < 0 || scoreless >= MAX_SCORELESS_TURNS) {
+            throw new IllegalArgumentException("Invalid running snapshot counters");
+        }
+        this.validator = Objects.requireNonNull(validator, "validator");
+        List<Tile> remaining = parseTiles(bagTiles);
+        Collections.shuffle(remaining, new Random(seed));
+        this.bag = new TileBag(remaining, seed);
+        this.players = List.of(new Player("Player 0"), new Player("Player 1"));
+        players.get(0).addTiles(parseTiles(rack0));
+        players.get(1).addTiles(parseTiles(rack1));
+        players.get(0).addScore(score0);
+        players.get(1).addScore(score1);
+        board.restore(tiles);
+        currentPlayerIndex = player;
+        scorelessTurns = scoreless;
+    }
+
+    /** Simulator boundary: restores an explicitly supplied world, never a live game's secrets. */
+    public static ScrabbleGame fromSnapshot(WordValidator validator, List<Placement> tiles,
+                                            String rack0, String rack1, int score0, int score1,
+                                            String bagTiles, int player, int scoreless, long seed) {
+        return new ScrabbleGame(validator, tiles, rack0, rack1, score0, score1,
+                bagTiles, player, scoreless, seed);
+    }
+
+    private static List<Tile> parseTiles(String letters) {
+        List<Tile> result = new ArrayList<>();
+        for (char letter : letters.toCharArray()) {
+            result.add(letter == '?' ? Tile.blankTile() : Tile.letterTile(letter));
+        }
+        return result;
     }
 
     public Board board() {

@@ -14,7 +14,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-learning = ["torch>=2.6,<3"]
+learning = ["torch>=2.6,<3", "PyYAML>=6,<7"]
+monitoring = ["psutil>=5", "tensorboard>=2.14"]
 
 [tool.setuptools.packages.find]
 where = ["python"]

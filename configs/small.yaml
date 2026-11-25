@@ -1,0 +1,29 @@
+# Initial full-dictionary experiments: small network and search budget.
+extends: base.yaml
+name: small
+model:
+  channels: 32
+  blocks: 4
+  latent: 128
+  rack_dim: 32
+  belief_dim: 32
+  global_dim: 16
+  move_dim: 64
+  policy_hidden: 128
+  value_hidden: 128
+search:
+  simulations: 16
+  depth: 2
+  candidates: 12
+  particles: 32
+selfplay:
+  games_per_iteration: 32
+replay:
+  capacity: 50000
+training:
+  steps_per_iteration: 60       # LR horizon estimate (~950 positions x 8 / 128)
+  batch_size: 128
+evaluation:
+  games: 20
+arena:
+  games: 20

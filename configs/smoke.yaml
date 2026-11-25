@@ -1,0 +1,42 @@
+# Fast end-to-end correctness check: built-in tiny lexicon, tiny network, CPU.
+# Exercises self-play, batched training, gated arena, baseline evaluation,
+# checkpoints and metrics in well under a minute. Not a strength benchmark.
+extends: base.yaml
+name: smoke
+iterations: 1
+dictionary: null             # built-in TinyLexicon (no external file needed)
+runtime:
+  device: cpu
+model:
+  channels: 16
+  blocks: 1
+  latent: 32
+  rack_dim: 16
+  belief_dim: 16
+  global_dim: 8
+  move_dim: 32
+  policy_hidden: 32
+  value_hidden: 32
+search:
+  simulations: 6
+  depth: 1
+  candidates: 6              # keep >= 6: pass and the largest exchange are reserved
+  particles: 8
+selfplay:
+  games_per_iteration: 2
+  workers: 0
+replay:
+  capacity: 512
+training:
+  steps_per_iteration: 4
+  batch_size: 16
+  min_replay: 1
+arena:
+  mode: gate
+  games: 2
+evaluation:
+  every: 1
+  games: 2
+  opponents: [greedy]
+logging:
+  hardware_interval: 0

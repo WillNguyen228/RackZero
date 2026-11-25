@@ -1,0 +1,27 @@
+# Higher-capacity A100 experiment. Larger network and batch; same search as
+# medium so the network-size effect is isolated. This network costs ~20 ms per
+# CPU inference call (~45% of search time). Batched GPU inference
+# (selfplay.inference: server) did NOT help in local measurements (mean batch
+# 1.6 with 8 workers; see docs/A100_TRAINING.md) -- benchmark it on Delta with
+# `--set selfplay.inference=server` before adopting it.
+extends: gpu.yaml
+name: large
+model:
+  channels: 128
+  blocks: 10
+  latent: 512
+  rack_dim: 128
+  belief_dim: 128
+  global_dim: 64
+  move_dim: 256
+  policy_hidden: 512
+  value_hidden: 512
+selfplay:
+  inference: local
+  inference_batch_size: 64
+  inference_precision: bf16
+replay:
+  capacity: 400000
+training:
+  steps_per_iteration: 30       # LR horizon estimate (~1900 positions x 8 / 512)
+  batch_size: 512

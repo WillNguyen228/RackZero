@@ -1,0 +1,22 @@
+# Main development baseline. Change ONE factor at a time against this file
+# (see docs/SCALING_PLAN.md); keep seeds and evaluation settings fixed.
+extends: base.yaml
+name: medium
+iterations: 40
+model:
+  channels: 64
+  blocks: 6
+  latent: 256
+search:
+  simulations: 32
+  depth: 2
+  candidates: 16
+  particles: 32
+selfplay:
+  games_per_iteration: 64
+  workers: 16
+replay:
+  capacity: 200000
+training:
+  steps_per_iteration: 60       # LR horizon estimate (~1900 positions x 8 / 256)
+  batch_size: 256

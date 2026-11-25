@@ -1,0 +1,25 @@
+# Paths are relative to the working directory. Load checkpoints from trusted sources only.
+dictionary: WOW24v3.zip
+seed: 42
+device: cpu
+threads: 1
+hidden: 128
+iterations: 10
+games_per_iteration: 8
+training_steps: 64
+batch_size: 32
+learning_rate: 0.001
+weight_decay: 0.0001
+replay_capacity: 20000
+arena_games: 8
+promotion_threshold: 0.55
+max_turns: 200
+temperature: 1.0
+output_dir: checkpoints
+search:
+  method: ismcts
+  simulations: 32
+  depth: 3
+  candidates: 16
+  exploration: 1.5
+  particles: 32

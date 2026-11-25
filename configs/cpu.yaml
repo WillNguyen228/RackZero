@@ -1,0 +1,8 @@
+# CPU-only debugging and baseline runs (laptop or CPU node).
+extends: small.yaml
+name: cpu
+runtime:
+  device: cpu
+  threads: 4
+selfplay:
+  workers: 4

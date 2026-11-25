@@ -122,3 +122,9 @@ jobs:
 
       - name: Test native integration and learning
         run: python -m unittest discover -s tests/python -v
+
+      - name: Smoke-test RackZero training, resume and checkpoint evaluation
+        run: |
+          python train.py --config configs/smoke.yaml --run-dir runs/ci-smoke
+          python train.py --resume runs/ci-smoke --set iterations=2
+          python evaluate.py --checkpoint runs/ci-smoke --games 2 --opponents greedy random

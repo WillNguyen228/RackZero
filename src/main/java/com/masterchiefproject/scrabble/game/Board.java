@@ -25,6 +25,21 @@ public final class Board {
     private final PremiumSquare[][] premiums = createPremiumLayout();
     private int tileCount;
 
+    void restore(List<Placement> placements) {
+        if (!isEmpty()) {
+            throw new IllegalStateException("Restore requires an empty board");
+        }
+        for (Placement placement : placements) {
+            Position p = placement.position();
+            requireInside(p.row(), p.col());
+            if (grid[p.row()][p.col()] != null) {
+                throw new IllegalArgumentException("Duplicate snapshot square");
+            }
+            grid[p.row()][p.col()] = placement.tile();
+            tileCount++;
+        }
+    }
+
     public Tile tileAt(int row, int col) {
         requireInside(row, col);
         return grid[row][col];

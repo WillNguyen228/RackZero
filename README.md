@@ -10,6 +10,9 @@ The browser demo is deployed from `docs/` to GitHub Pages on pushes to `main`.
 
 The Java implementation is the primary rules engine. A JavaScript browser adaptation mirrors the main placement, scoring, exchange, and game-ending rules so the project can be evaluated without a local Java installation.
 
+**Neural self-play:** see the [RackZero setup and architecture guide](docs/RACKZERO.md)
+for imperfect-information search, PyTorch training, checkpoints and evaluation.
+
 ## Highlights
 
 - Standard 15 x 15 board
@@ -813,3 +816,43 @@ bundled in this repository's ordinary Java/Python builds.
 The repository began as a university Book Scrabble assignment. The current version uses a standard Maven structure, separates production code from tests and browser assets, strengthens board and dictionary behavior, preserves the networking component, and adds a polished browser demonstration with automated verification.
 
 http://localhost:8000
+
+## AlphaZero-style Scrabble self-play
+
+RackZero is a modular PyTorch pipeline built on the existing Java/Gymnasium
+engine. It has:
+
+* tile-conserving, Rao-Blackwellized opponent-rack beliefs;
+* five sampled-chance search variants;
+* a configurable ResNet that scores the generator's legal moves (the original
+  MLP is kept as a baseline);
+* parallel self-play workers, batched (bf16) GPU training and full
+  checkpoint/resume;
+* evaluation with confidence intervals, and information-leakage tests.
+
+**[Setup, architecture and commands](docs/RACKZERO.md)** |
+**[A100 / NCSA Delta guide](docs/A100_TRAINING.md)** |
+**[Scaling experiment plan](docs/SCALING_PLAN.md)** |
+**[Audit and results report](docs/RACKZERO_REPORT.md)** |
+**[AlphaZero reference review](docs/ALPHAZERO_REFERENCE.md)**
+
+With Python 3.10+ and JDK 17+ installed, from the repository root:
+
+```powershell
+python -m pip install -e ".[learning]"
+python -m scrabble_gym.build
+python train.py --config configs\smoke.yaml --run-dir runs\smoke
+python evaluate.py --checkpoint runs\smoke --games 4 --opponents greedy random
+```
+
+The smoke configuration needs no external lexicon. For full-dictionary
+training, provide a permitted local WOW24 lexicon as documented above:
+
+```powershell
+python train.py --config configs\medium.yaml --set selfplay.workers=8
+python evaluate.py --checkpoint runs\<run-directory> --opponents greedy heuristic --games 200
+```
+
+This is a functional research framework, not a claim of tournament strength.
+WOW24 has separate non-profit-use terms; it is not bundled or relicensed.
+Only load trusted checkpoints.
