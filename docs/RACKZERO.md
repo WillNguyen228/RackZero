@@ -80,6 +80,7 @@ files in `models/`.
 | `large.yaml` | 4.3M-parameter network for A100 runs |
 | `cpu.yaml` | CPU debugging (small + 4 workers) |
 | `gpu.yaml` | medium on one A100: bf16 training, 15 CPU self-play workers |
+| `warm.yaml` | `gpu.yaml` + mixed shortlist, playout cap randomization, q/z value target; start it from a Quackle warm start (see "Warm start and training improvements") |
 | `default.yaml` | the **original** flat schema-1 configuration, kept unchanged; it loads as the `legacy_mlp` baseline |
 
 ```powershell
@@ -168,6 +169,126 @@ because their replay stored pre-encoded float features.
 produce **no training targets**. Evaluation discards an entire seed/seat pair
 if either game truncates. Both paths fail explicitly if no natural outcomes
 remain. Monitor the truncation counts.
+
+## Warm start and training improvements
+
+These additions follow published AlphaZero-family practice. Each one is a
+config switch. Every switch except the exploration fix defaults to the original
+behaviour, and `configs/warm.yaml` turns on the recommended combination.
+
+| Feature | Setting(s) | Source | Default |
+|---|---|---|---|
+| Root Dirichlet noise + early-game temperature | `search.root_noise_alpha/fraction`, `selfplay.temperature_moves` | AlphaZero | **on in `base.yaml`** (α 0.3, ε 0.25, temperature 1 for 8 plies then greedy) |
+| Mixed shortlist | `search.shortlist: mixed` | — | `score` |
+| Playout cap randomization | `selfplay.full_search_probability`, `selfplay.full_simulations`, `selfplay.fast_simulations` | KataGo (Wu 2019) | off (1.0) |
+| Gumbel root search | `search.root_selection: gumbel`, `search.gumbel_*` | Gumbel AlphaZero (Danihelka et al. 2022) | `puct` |
+| Value target mixing | `training.value_target_q_weight` | Leela Chess Zero / KataGo | 0 |
+| Reanalyse | `reanalyse.fraction` | MuZero Reanalyse (Schrittwieser et al. 2021) | 0 |
+| Warm start from Quackle | `init_from` + `python -m rackzero.warmstart` | AlphaGo's supervised start | none |
+| Quackle evaluation opponent | `evaluate.py --opponents quackle` | — | — |
+
+**Exploration.** Earlier configs sampled every move at temperature 1 from the
+visit counts and used no root noise. With 32 simulations over 16 candidates
+(about two visits each), that made self-play close to random. The value targets
+then described noisy play rather than good play. AlphaZero samples only in the
+opening and adds Dirichlet noise to the root priors. Evaluation and the arena
+never use noise. Runs saved before this change keep their own settings when
+resumed, because a resume uses the saved configuration.
+
+**Mixed shortlist.** Search considers only `search.candidates` moves. The
+original shortlist keeps the top scores, plus the pass and the largest
+exchange. Measured on 4,000 WOW24 Quackle-vs-Quackle games (98,857
+decisions), Quackle's chosen move was in the top-16-by-score shortlist only
+**84.3%** of the time. It was in a mixed shortlist (8 by score, 8 by score +
+the `heuristic` leave term) **88.3%** of the time. Partial exchanges also become reachable in
+the mixed shortlist. The heuristic only proposes candidates: the network still
+chooses among them.
+
+**Playout cap randomization.** With probability
+`full_search_probability`, a move gets a full search: `full_simulations`
+simulations (default `search.simulations`) with root noise, recorded as a policy target (`policy_weight` 1).
+Otherwise it gets a fast search of `fast_simulations` with no noise. The fast
+move still plays the game and provides value targets, but its policy is
+excluded from the policy loss (`policy_weight` 0). `warm.yaml` uses 25% × 64 +
+75% × 16 ≈ 28 simulations per move on average, against 32 before. The policy
+targets now come from 64-simulation searches. `search.simulations` stays 32,
+so evaluation and the arena match `gpu.yaml` runs.
+
+**Gumbel root search** (`root_selection: gumbel`). Gumbel-top-k sampling picks
+`gumbel_actions` root moves. Sequential halving then spends the budget on the
+most promising of them. The policy target is
+`softmax(log prior + σ(completed Q))`, where unvisited moves get the value
+estimate v_mix. Self-play plays the sampled action. Evaluation uses no Gumbel
+noise (`gumbel_scale: 0`). Unlike `mctx`, Q is not min-max rescaled per node;
+it is mapped from [-1, 1] to [0, 1]. With very noisy Scrabble Q estimates this
+gives a softer target. `gumbel_c_scale` controls how sharp the target is.
+Interior nodes still use PUCT (ISMCTS).
+
+**Value target mixing.** Every record stores the search's root value q, from
+the point of view of the player to move. The value head is trained on
+`(1 - w) · z + w · q`, where z is the game result (±1). Scrabble results are
+dominated by tile luck, so q is a lower-variance target. The margin head
+still learns the real final margin.
+
+**Reanalyse.** After self-play, `fraction × new positions` stored positions
+are searched again with the current network, with no noise. Their policy and
+search-value targets are then replaced. The record stores the root belief
+features but not the particle set, so reanalysed searches draw their
+determinizations from the tile-conserving prior over unseen tiles. They lose
+the inference from the opponent's past plays. Reanalyse uses the same
+CPU-bound search as self-play, so it costs self-play time. It does **not**
+use the idle GPU.
+
+**Warm start.** Quackle's static player picks the move with the best equity
+(score plus a rack-leave value). `generate` plays Quackle against Quackle,
+with the Java engine checking every move. For each decision it records the
+acting player's view, the candidate set, a policy target and the game outcome.
+The candidate set holds Quackle's 8 best moves plus the run's shortlist. The
+policy target is `softmax(equity / 2)` over Quackle's 10 best moves.
+`pretrain` fits the run's network to these records, holding out 5% of the
+games. It runs in two phases. First, the policy phase trains the whole network
+on the policy loss and keeps the epoch with the best validation policy loss.
+Second, the value phase re-initializes the value and margin heads, trains the
+whole network on policy + value + margin for 2 epochs, and keeps the better
+epoch. Every position in a game shares one outcome, so value heads memorize
+games when they train jointly for long. On 4,000 games, validation value loss
+rose from 0.69 to 0.91 over 10 joint epochs. Fitting only the heads on the
+frozen policy trunk gave 0.87. It writes a normal checkpoint, which you can evaluate with `evaluate.py` and pass
+as `init_from` to start a run. Only `generate` and the `quackle` opponent need a
+local Quackle build. The `.npz` dataset and the checkpoint are plain files you
+can copy to a cluster.
+
+```bash
+# 1. On a machine with Quackle (python -m scrabble_gym.quackle_build):
+python -m rackzero.warmstart generate --config configs/warm.yaml \
+    --set runtime.device=cpu --set runtime.precision=fp32 \
+    --games 2000 --workers 8 --output data/quackle-wow24-2000.npz
+# 2. Pre-train (GPU if available):
+python -m rackzero.warmstart pretrain --config configs/warm.yaml \
+    --data data/quackle-wow24-2000.npz --epochs 10
+# 3. Evaluate the pre-trained network, then start self-play from it:
+python evaluate.py --checkpoint runs/<warm-pretrain-run>/checkpoints/pretrained.pt \
+    --opponents greedy heuristic quackle --games 200 --workers 8
+python train.py --config configs/warm.yaml \
+    --set init_from=runs/<warm-pretrain-run>/checkpoints/pretrained.pt
+```
+
+`init_from` copies only the network weights. It requires the same model
+settings and dictionary, and it is ignored on resume. The Quackle bridge
+(`native/quackle/main.cpp`) gained `--serve`, which answers many positions from
+one process, and `--top N`, which reports ranked moves with equities. With
+WOW24, a call takes about 0.014 s, against 0.38 s when a new process starts
+for every position. The default one-shot output is unchanged.
+
+**Live move generation.** `Game(movegen="fast")` lists the live game's legal
+moves with the same cached generator that search uses. Workers and evaluation
+pass `search.movegen`, which defaults to `fast`. The list is identical to the
+Java-preview list (tested on whole games), and Java still validates and scores
+every move that is played. On the Windows laptop, the Java-preview generator
+took about 1 s per live decision with WOW24, which was 94% of a Quackle teacher
+game: one game went from 27.7 s to 2.1 s. On Delta (Linux) the
+`gpu-20261124-235040` run measured only 0.11–0.14 s per live decision, about
+7% of self-play time, so the gain in self-play there is small.
 
 ## Representations and interfaces
 

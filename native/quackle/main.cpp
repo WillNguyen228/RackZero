@@ -1,7 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Quackle static-player bridge.
+//
+//   quackle_bridge [lexicon.dawg] [--top N] [--serve]
+//
+// Input per position (whitespace separated): 225 board cells ('.' empty,
+// 'A'-'Z' tile, 'a'-'z' blank), rack ('A'-'Z', '?'), bag size.
+//
+// Default output (one-shot, unchanged): the best move by Quackle's static
+// score-plus-leave equity, as one PLACE/EXCHANGE/PASS block.
+// --top N: "MOVES k", then for each of the k <= N best moves in equity order a
+// line "EQUITY e" followed by its block.
+// --serve: answer positions until end of input; every answer (or "ERROR msg")
+// ends with a line "END" and is flushed, so one process serves many requests.
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -16,118 +32,184 @@
 #include "lexiconparameters.h"
 #include "strategyparameters.h"
 
-int main(int argc, char* argv[]) {
-    try {
-        if (argc > 2) throw std::runtime_error("Expected at most one lexicon path");
-        std::string cells, rackText;
-        int bagSize;
-        if (!(std::cin >> cells >> rackText >> bagSize) || cells.size() != 225
-            || rackText.empty() || rackText.size() > 7 || bagSize < 0 || bagSize > 100)
-            throw std::runtime_error("Invalid position");
-        for (char c : cells)
-            if (c != '.' && !(c >= 'A' && c <= 'Z') && !(c >= 'a' && c <= 'z'))
-                throw std::runtime_error("Invalid board letter");
-        for (char c : rackText)
-            if (c != '?' && !(c >= 'A' && c <= 'Z'))
-                throw std::runtime_error("Invalid rack letter");
+namespace {
 
-        Quackle::DataManager data;
-        // Upstream's default EnglishBoard is a nonstandard 13x17 demonstration layout.
-        auto* layout = new Quackle::BoardParameters;
+void setup(Quackle::DataManager& data, const std::string& lexicon) {
+    // Upstream's default EnglishBoard is a nonstandard 13x17 demonstration layout.
+    auto* layout = new Quackle::BoardParameters;
+    for (const auto& cell : std::vector<std::pair<int, int>>{
+             {0,0},{0,7},{0,14},{7,0},{7,14},{14,0},{14,7},{14,14}})
+        layout->setWordMultiplier(cell.first, cell.second, Quackle::BoardParameters::tws);
+    for (int i = 1; i <= 4; ++i)
         for (const auto& cell : std::vector<std::pair<int, int>>{
-                 {0,0},{0,7},{0,14},{7,0},{7,14},{14,0},{14,7},{14,14}})
-            layout->setWordMultiplier(cell.first, cell.second, Quackle::BoardParameters::tws);
-        for (int i = 1; i <= 4; ++i)
-            for (const auto& cell : std::vector<std::pair<int, int>>{
-                     {i,i},{i,14-i},{14-i,i},{14-i,14-i}})
-                layout->setWordMultiplier(cell.first, cell.second, Quackle::BoardParameters::dws);
-        layout->setWordMultiplier(7, 7, Quackle::BoardParameters::dws);
-        for (const auto& cell : std::vector<std::pair<int, int>>{
-                 {1,5},{1,9},{5,1},{5,5},{5,9},{5,13},{9,1},{9,5},{9,9},{9,13},{13,5},{13,9}})
-            layout->setLetterMultiplier(cell.first, cell.second, Quackle::BoardParameters::tls);
-        for (const auto& cell : std::vector<std::pair<int, int>>{
-                 {0,3},{0,11},{2,6},{2,8},{3,0},{3,7},{3,14},{6,2},{6,6},{6,8},{6,12},
-                 {7,3},{7,11},{8,2},{8,6},{8,8},{8,12},{11,0},{11,7},{11,14},
-                 {12,6},{12,8},{14,3},{14,11}})
-            layout->setLetterMultiplier(cell.first, cell.second, Quackle::BoardParameters::dls);
-        data.setBoardParameters(layout);
-        data.setAppDataDirectory("third_party/quackle/data");
-        data.setUserDataDirectory("target/quackle");
-        data.lexiconParameters()->loadDawg(argc == 2 ? argv[1] : "target/quackle/demo.dawg");
-        if (!data.lexiconParameters()->hasDawg())
-            throw std::runtime_error("Demo lexicon not built");
-        data.strategyParameters()->initialize("default_english");
-        if (!data.strategyParameters()->hasWorths() || !data.strategyParameters()->hasSyn2())
-            throw std::runtime_error("Quackle rack-leave strategy data unavailable");
-        data.setEvaluator(new Quackle::ScorePlusLeaveEvaluator);
-        auto* alphabet = data.alphabetParameters();
-        Quackle::Board board;
-        board.prepareEmptyBoard();
-        for (int i = 0; i < 225; ++i) {
-            if (cells[i] == '.') continue;
-            board.makeMove(Quackle::Move::createPlaceMove(
-                i / 15, i % 15, true, alphabet->encode(std::string(1, cells[i]))));
+                 {i,i},{i,14-i},{14-i,i},{14-i,14-i}})
+            layout->setWordMultiplier(cell.first, cell.second, Quackle::BoardParameters::dws);
+    layout->setWordMultiplier(7, 7, Quackle::BoardParameters::dws);
+    for (const auto& cell : std::vector<std::pair<int, int>>{
+             {1,5},{1,9},{5,1},{5,5},{5,9},{5,13},{9,1},{9,5},{9,9},{9,13},{13,5},{13,9}})
+        layout->setLetterMultiplier(cell.first, cell.second, Quackle::BoardParameters::tls);
+    for (const auto& cell : std::vector<std::pair<int, int>>{
+             {0,3},{0,11},{2,6},{2,8},{3,0},{3,7},{3,14},{6,2},{6,6},{6,8},{6,12},
+             {7,3},{7,11},{8,2},{8,6},{8,8},{8,12},{11,0},{11,7},{11,14},
+             {12,6},{12,8},{14,3},{14,11}})
+        layout->setLetterMultiplier(cell.first, cell.second, Quackle::BoardParameters::dls);
+    data.setBoardParameters(layout);
+    data.setAppDataDirectory("third_party/quackle/data");
+    data.setUserDataDirectory("target/quackle");
+    data.lexiconParameters()->loadDawg(lexicon);
+    if (!data.lexiconParameters()->hasDawg())
+        throw std::runtime_error("Demo lexicon not built");
+    data.strategyParameters()->initialize("default_english");
+    if (!data.strategyParameters()->hasWorths() || !data.strategyParameters()->hasSyn2())
+        throw std::runtime_error("Quackle rack-leave strategy data unavailable");
+    data.setEvaluator(new Quackle::ScorePlusLeaveEvaluator);
+}
+
+void writeMove(std::ostream& out, Quackle::DataManager& data, const Quackle::Move& move,
+               const std::string& rackText) {
+    auto* alphabet = data.alphabetParameters();
+    if (!std::isfinite(move.equity)) throw std::runtime_error("Invalid engine equity");
+    std::vector<bool> used(rackText.size(), false);
+    auto rackIndex = [&](char letter) {
+        for (std::size_t j = 0; j < rackText.size(); ++j) {
+            if (!used[j] && rackText[j] == letter) {
+                used[j] = true;
+                return static_cast<int>(j);
+            }
         }
-        Quackle::PlayerList players;
-        players.push_back(Quackle::Player("Agent", Quackle::Player::ComputerPlayerType, 1));
-        players.push_back(Quackle::Player("Unknown", Quackle::Player::HumanPlayerType, 2));
-        Quackle::GamePosition position(players);
-        // Quackle copies pregame positions with no current player until the first increment.
-        position.incrementTurn();
-        if (!position.setCurrentPlayer(1)) throw std::runtime_error("Cannot set player");
-        position.setBoard(board);
-        position.setCurrentPlayerRack(Quackle::Rack(alphabet->encode(rackText)), false);
-        Quackle::Bag bag;
-        bag.clear();
-        // Static evaluation needs only bag size, never actual hidden bag contents.
-        bag.toss(Quackle::LongLetterString(bagSize, QUACKLE_BLANK_MARK));
-        position.setBag(bag);
-        position.ensureBoardIsPreparedForAnalysis();
-        Quackle::Generator generator(position);
-        generator.kibitz(1, bagSize < 7 ? Quackle::Generator::CannotExchange : 0);
-        const auto& move = generator.kibitzList().at(0);
-        if (!std::isfinite(move.equity)) throw std::runtime_error("Invalid engine equity");
-        std::vector<bool> used(rackText.size(), false);
-        auto rackIndex = [&](char letter) {
-            for (std::size_t j = 0; j < rackText.size(); ++j) {
-                if (!used[j] && rackText[j] == letter) {
-                    used[j] = true;
-                    return static_cast<int>(j);
-                }
+        throw std::runtime_error("Engine move does not match rack");
+    };
+    if (move.action == Quackle::Move::Place) {
+        struct Placement { int row, col, index; char letter; bool blank; };
+        std::vector<Placement> placements;
+        int offset = 0;
+        for (auto letter : move.tiles()) {
+            int row = move.startrow + (move.horizontal ? 0 : offset);
+            int col = move.startcol + (move.horizontal ? offset : 0);
+            ++offset;
+            if (Quackle::Move::isAlreadyOnBoard(letter)) continue;
+            bool blank = alphabet->isBlankLetter(letter);
+            auto decoded = alphabet->userVisible(alphabet->clearBlankness(letter));
+            if (decoded.size() != 1) throw std::runtime_error("Non-English engine tile");
+            placements.push_back({row, col, rackIndex(blank ? '?' : decoded[0]), decoded[0], blank});
+        }
+        out << "PLACE " << move.score << " " << move.equity << " " << placements.size() << "\n";
+        for (const auto& p : placements)
+            out << p.row << " " << p.col << " " << p.index << " " << p.letter << " " << p.blank << "\n";
+    } else if (move.action == Quackle::Move::Exchange) {
+        std::vector<int> indexes;
+        for (auto letter : move.tiles()) {
+            auto decoded = alphabet->userVisible(letter);
+            if (decoded.size() != 1) throw std::runtime_error("Invalid exchange tile");
+            indexes.push_back(rackIndex(decoded[0]));
+        }
+        out << "EXCHANGE " << indexes.size();
+        for (int index : indexes) out << " " << index;
+        out << "\n";
+    } else if (move.action == Quackle::Move::Pass) {
+        out << "PASS\n";
+    } else {
+        throw std::runtime_error("Unsupported engine move");
+    }
+}
+
+// Returns false at end of input.
+bool solve(std::istream& in, std::ostream& out, Quackle::DataManager& data, int top) {
+    std::string cells, rackText;
+    int bagSize;
+    if (!(in >> cells)) return false;
+    if (!(in >> rackText >> bagSize) || cells.size() != 225
+        || rackText.empty() || rackText.size() > 7 || bagSize < 0 || bagSize > 100)
+        throw std::runtime_error("Invalid position");
+    for (char c : cells)
+        if (c != '.' && !(c >= 'A' && c <= 'Z') && !(c >= 'a' && c <= 'z'))
+            throw std::runtime_error("Invalid board letter");
+    for (char c : rackText)
+        if (c != '?' && !(c >= 'A' && c <= 'Z'))
+            throw std::runtime_error("Invalid rack letter");
+
+    auto* alphabet = data.alphabetParameters();
+    Quackle::Board board;
+    board.prepareEmptyBoard();
+    for (int i = 0; i < 225; ++i) {
+        if (cells[i] == '.') continue;
+        board.makeMove(Quackle::Move::createPlaceMove(
+            i / 15, i % 15, true, alphabet->encode(std::string(1, cells[i]))));
+    }
+    Quackle::PlayerList players;
+    players.push_back(Quackle::Player("Agent", Quackle::Player::ComputerPlayerType, 1));
+    players.push_back(Quackle::Player("Unknown", Quackle::Player::HumanPlayerType, 2));
+    Quackle::GamePosition position(players);
+    // Quackle copies pregame positions with no current player until the first increment.
+    position.incrementTurn();
+    if (!position.setCurrentPlayer(1)) throw std::runtime_error("Cannot set player");
+    position.setBoard(board);
+    position.setCurrentPlayerRack(Quackle::Rack(alphabet->encode(rackText)), false);
+    Quackle::Bag bag;
+    bag.clear();
+    // Static evaluation needs only bag size, never actual hidden bag contents.
+    bag.toss(Quackle::LongLetterString(bagSize, QUACKLE_BLANK_MARK));
+    position.setBag(bag);
+    position.ensureBoardIsPreparedForAnalysis();
+    Quackle::Generator generator(position);
+    generator.kibitz(std::max(1, top), bagSize < 7 ? Quackle::Generator::CannotExchange : 0);
+    const auto& moves = generator.kibitzList();
+    if (moves.empty()) throw std::runtime_error("Engine returned no moves");
+    std::ostringstream answer;
+    if (top > 0) {
+        std::size_t count = std::min<std::size_t>(moves.size(), static_cast<std::size_t>(top));
+        answer << "MOVES " << count << "\n";
+        for (std::size_t i = 0; i < count; ++i) {
+            answer << "EQUITY " << moves[i].equity << "\n";
+            writeMove(answer, data, moves[i], rackText);
+        }
+    } else {
+        writeMove(answer, data, moves.at(0), rackText);
+    }
+    out << answer.str();
+    return true;
+}
+
+}  // namespace
+
+int main(int argc, char* argv[]) {
+    std::string lexicon = "target/quackle/demo.dawg";
+    int top = 0;
+    bool serve = false;
+    try {
+        bool lexiconGiven = false;
+        for (int i = 1; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg == "--serve") {
+                serve = true;
+            } else if (arg == "--top") {
+                if (i + 1 >= argc) throw std::runtime_error("--top needs a count");
+                top = std::atoi(argv[++i]);
+                if (top < 1 || top > 1000) throw std::runtime_error("--top must be 1..1000");
+            } else if (!lexiconGiven && arg.rfind("--", 0) != 0) {
+                lexicon = arg;
+                lexiconGiven = true;
+            } else {
+                throw std::runtime_error("Expected [lexicon] [--top N] [--serve]");
             }
-            throw std::runtime_error("Engine move does not match rack");
-        };
-        if (move.action == Quackle::Move::Place) {
-            struct Placement { int row, col, index; char letter; bool blank; };
-            std::vector<Placement> placements;
-            int offset = 0;
-            for (auto letter : move.tiles()) {
-                int row = move.startrow + (move.horizontal ? 0 : offset);
-                int col = move.startcol + (move.horizontal ? offset : 0);
-                ++offset;
-                if (Quackle::Move::isAlreadyOnBoard(letter)) continue;
-                bool blank = alphabet->isBlankLetter(letter);
-                auto decoded = alphabet->userVisible(alphabet->clearBlankness(letter));
-                if (decoded.size() != 1) throw std::runtime_error("Non-English engine tile");
-                placements.push_back({row, col, rackIndex(blank ? '?' : decoded[0]), decoded[0], blank});
+        }
+        Quackle::DataManager data;
+        setup(data, lexicon);
+        if (!serve) {
+            if (!solve(std::cin, std::cout, data, top)) throw std::runtime_error("Invalid position");
+            return 0;
+        }
+        std::string line, request;
+        // One request per line: "<cells> <rack> <bag>".
+        while (std::getline(std::cin, line)) {
+            if (line.find_first_not_of(" \t\r") == std::string::npos) continue;
+            std::istringstream in(line);
+            try {
+                solve(in, std::cout, data, top);
+            } catch (const std::exception& error) {
+                std::cout << "ERROR " << error.what() << "\n";
             }
-            std::cout << "PLACE " << move.score << " " << move.equity << " " << placements.size() << "\n";
-            for (const auto& p : placements)
-                std::cout << p.row << " " << p.col << " " << p.index << " " << p.letter << " " << p.blank << "\n";
-        } else if (move.action == Quackle::Move::Exchange) {
-            std::vector<int> indexes;
-            for (auto letter : move.tiles()) {
-                auto decoded = alphabet->userVisible(letter);
-                if (decoded.size() != 1) throw std::runtime_error("Invalid exchange tile");
-                indexes.push_back(rackIndex(decoded[0]));
-            }
-            std::cout << "EXCHANGE " << indexes.size();
-            for (int index : indexes) std::cout << " " << index;
-            std::cout << "\n";
-        } else if (move.action == Quackle::Move::Pass) {
-            std::cout << "PASS\n";
-        } else {
-            throw std::runtime_error("Unsupported engine move");
+            std::cout << "END" << std::endl;
         }
         return 0;
     } catch (const std::exception& error) {

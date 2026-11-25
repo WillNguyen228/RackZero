@@ -51,7 +51,24 @@ TARGET_FIELDS = {
     "policy": (("K",), np.float32),
     "win": ((), np.float32),
     "margin": ((), np.float32),
+    # Root value backed up by search (player-to-move view); mixed into the value
+    # target with training.value_target_q_weight.
+    "search_value": ((), np.float32),
+    # 1 if ``policy`` is a training target (full search / teacher), 0 otherwise
+    # (playout cap randomization's fast searches).
+    "policy_weight": ((), np.float32),
 }
+
+
+def fill_target_defaults(batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Add targets missing from older records so they train exactly as before:
+    search_value = win (q-mixing has no effect) and policy_weight = 1."""
+    batch = dict(batch)
+    if "search_value" not in batch and "win" in batch:
+        batch["search_value"] = np.asarray(batch["win"], dtype=np.float32).copy()
+    if "policy_weight" not in batch and "policy" in batch:
+        batch["policy_weight"] = np.ones(len(batch["policy"]), dtype=np.float32)
+    return batch
 
 
 def field_shape(spec: tuple, candidates: int) -> tuple[int, ...]:
@@ -171,6 +188,66 @@ def encode_record(info: InformationState, moves: tuple[ScoredMove, ...], belief:
             for slot, letter in enumerate(move.exchange):
                 record["cand_letters"][k, slot] = ALPHABET.index(letter) + 1
     return record
+
+
+def record_moves(record: dict[str, np.ndarray]) -> tuple[ScoredMove, ...]:
+    """The candidate moves stored in a record, in slot order (inverse of encode_record)."""
+    from scrabble_gym.environment import Move
+
+    board = np.asarray(record["board"]).reshape(15, 15)
+    moves = []
+    for k in np.flatnonzero(record["cand_mask"]):
+        kind = KINDS[int(record["cand_kind"][k])]
+        score = int(record["cand_score"][k])
+        if kind == "pass":
+            moves.append(ScoredMove(Move(), score))
+        elif kind == "exchange":
+            letters = "".join(ALPHABET[int(x) - 1] for x in record["cand_letters"][k] if x > 0)
+            moves.append(ScoredMove(Move("exchange", exchange=letters), score))
+        else:
+            start, direction = int(record["cand_start"][k]), int(record["cand_dir"][k])
+            row, col = divmod(start, 15)
+            dr, dc = DIRECTIONS[direction]
+            word, blanks, slot = "", [], 0
+            for i in range(int(record["cand_len"][k])):
+                r, c = row + dr * i, col + dc * i
+                if board[r, c]:
+                    word += ALPHABET[int(board[r, c]) - 1]
+                    continue
+                word += ALPHABET[int(record["cand_letters"][k, slot]) - 1]
+                if record["cand_blanks"][k, slot]:
+                    blanks.append(i)
+                slot += 1
+            moves.append(ScoredMove(Move("place", row, col, direction, word, tuple(blanks)),
+                                    score))
+    return tuple(moves)
+
+
+def record_information(record: dict[str, np.ndarray]):
+    """(InformationState, candidate moves) reconstructed from a stored record.
+
+    The observer is placed in seat 0 (scores are stored as own/opponent). The
+    opponent's latest public event is restored from the record's scalars so the
+    network sees the same inputs; earlier history is not stored.
+    """
+    from rackzero.game import PublicEvent
+
+    s = np.asarray(record["scalars"], dtype=np.float64)
+    observation = {
+        "board": np.asarray(record["board"], dtype=np.int8).reshape(15, 15),
+        "board_blanks": np.asarray(record["blanks"], dtype=np.int8).reshape(15, 15),
+        "rack": np.asarray(record["rack"], dtype=np.int64),
+        "scores": np.array([int(s[0]), int(s[1])], dtype=np.int64),
+        "player": 0, "opponent_rack_size": int(s[3]), "bag_size": int(s[2]),
+        "scoreless_turns": int(s[4]), "turn": int(s[5]),
+    }
+    history = ()
+    if s[6] or s[7] or s[8]:
+        played = [0] * 27
+        played[26] = int(s[8])   # only the count of tiles played enters the features
+        kind = "place" if s[8] else ("exchange" if s[7] else "pass")
+        history = (PublicEvent(1, kind, tuple(played), int(s[7]), int(s[6]), 0, 0),)
+    return InformationState(observation, history), record_moves(record)
 
 
 def pad_record(record: dict[str, np.ndarray], candidates: int) -> dict[str, np.ndarray]:

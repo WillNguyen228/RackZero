@@ -19,7 +19,7 @@ Inference modes:
 from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import itertools
 import multiprocessing
 import queue
@@ -71,10 +71,21 @@ class WorkerContext:
             raise ValueError("Worker lexicon fingerprint does not match the trainer's")
         self.spec = spec
         self.words = lexicon.words
-        self.game = Game(self.words, max_turns=spec.max_turns, particles=spec.particles)
+        self.game = Game(self.words, max_turns=spec.max_turns, particles=spec.particles,
+                         movegen=spec.movegen)
         self.simulator = Simulator(self.words, max_turns=spec.max_turns, movegen=spec.movegen)
         self.client = client
         self._models: dict[str, object] = {}
+        self._quackle = None
+
+    def quackle(self, top: int = 10):
+        """This worker's Quackle process (started on first use)."""
+        if self._quackle is None or self._quackle.top != top:
+            from rackzero.quackle import QuackleEngine
+            if self._quackle is not None:
+                self._quackle.close()
+            self._quackle = QuackleEngine(self.words, top=top)
+        return self._quackle
 
     def evaluator(self, ref: ModelRef | None):
         if ref is None:
@@ -130,6 +141,9 @@ class SelfPlayTask:
     temperature: float = 1.0
     temperature_moves: int | None = None
     final_temperature: float = 0.0
+    full_search_probability: float = 1.0
+    fast_simulations: int | None = None
+    full_simulations: int | None = None
 
 
 def selfplay_seed(base: int, iteration: int, game: int) -> int:
@@ -150,11 +164,27 @@ def _counters(ctx: WorkerContext, evaluator) -> dict:
 
 
 def play_selfplay_game(ctx: WorkerContext, task: SelfPlayTask) -> dict:
-    """One self-play game -> stacked replay records (None if truncated) and timings."""
-    game_seq, search_seq, belief_seq = np.random.SeedSequence(task.seed).spawn(3)
+    """One self-play game -> stacked replay records (None if truncated) and timings.
+
+    With playout cap randomization (``full_search_probability < 1``) each move is
+    a full search with probability p (recorded as a policy target) or a fast
+    search without root noise (``policy_weight`` 0: value targets only).
+    """
+    # The fourth stream is only used for playout-cap coin flips, so games with
+    # full_search_probability == 1 are identical to before it existed.
+    game_seq, search_seq, belief_seq, cap_seq = np.random.SeedSequence(task.seed).spawn(4)
     evaluator = ctx.evaluator(task.model)
     rng = np.random.default_rng(search_seq)
-    search = Search(ctx.simulator, evaluator, SearchConfig(**task.search), rng)
+    full_config = SearchConfig(**task.search)
+    if task.full_simulations is not None:
+        full_config = replace(full_config, simulations=task.full_simulations)
+    search = Search(ctx.simulator, evaluator, full_config, rng)
+    capped = task.full_search_probability < 1
+    fast_search = (Search(ctx.simulator, evaluator, replace(
+        full_config, simulations=task.fast_simulations, root_noise_fraction=0.0), rng)
+        if capped else None)
+    cap_rng = np.random.default_rng(cap_seq)
+    full_moves = 0
     game = ctx.game
     before = _counters(ctx, evaluator)
     started = time.perf_counter()
@@ -169,7 +199,9 @@ def play_selfplay_game(ctx: WorkerContext, task: SelfPlayTask) -> dict:
             t0 = time.perf_counter()
             moves = game.legal_moves()
             t1 = time.perf_counter()
-            result = search.run(info, moves=moves, belief=belief)
+            full = not capped or cap_rng.random() < task.full_search_probability
+            full_moves += full
+            result = (search if full else fast_search).run(info, moves=moves, belief=belief)
             t2 = time.perf_counter()
             live_movegen += t1 - t0
             search_seconds += t2 - t1
@@ -183,10 +215,15 @@ def play_selfplay_game(ctx: WorkerContext, task: SelfPlayTask) -> dict:
                                    task.candidates)
             record["policy"] = np.zeros(task.candidates, dtype=np.float32)
             record["policy"][:len(policy)] = policy
+            record["search_value"] = np.float32(result.value)
+            record["policy_weight"] = np.float32(1.0 if full else 0.0)
             records.append(record)
             players.append(int(info.observation["player"]))
             tau = temperature_at(task, ply)
-            if tau == 0:
+            if result.selected is not None:
+                # Gumbel root: the sampled action (Gumbel-max over the improved policy).
+                selected = int(result.selected)
+            elif tau == 0:
                 selected = int(np.argmax(policy))
             else:
                 weights = np.log(np.maximum(policy, 1e-300))
@@ -208,7 +245,7 @@ def play_selfplay_game(ctx: WorkerContext, task: SelfPlayTask) -> dict:
         games=1, natural_games=int(natural), truncated_games=int(not natural),
         plies=len(records), seconds=time.perf_counter() - started,
         search_seconds=search_seconds, live_movegen_seconds=live_movegen,
-        game_step_seconds=step_seconds, belief_resets=resets,
+        game_step_seconds=step_seconds, belief_resets=resets, full_searches=full_moves,
     )
     batch = None
     if natural:
@@ -243,10 +280,130 @@ def play_evaluation_game(ctx: WorkerContext, task: EvalGameTask):
     baseline = ctx.evaluator(task.opponent_model) or model
     return play_game(ctx.words, ctx.simulator, model, baseline, task.opponent,
                      SearchConfig(**task.search), SearchConfig(**task.opponent_search),
-                     task.max_turns, task.game_seed, task.seat, game_factory=ctx.game_factory)
+                     task.max_turns, task.game_seed, task.seat, game_factory=ctx.game_factory,
+                     quackle=ctx.quackle() if task.opponent == "quackle" else None)
 
 
-TASKS = {"selfplay": play_selfplay_game, "eval_game": play_evaluation_game}
+@dataclass(frozen=True)
+class ReanalyseTask:
+    seed: int
+    model: ModelRef
+    search: dict
+    records: dict          # stacked records (numpy arrays) to re-search
+
+
+def reanalyse_records(ctx: WorkerContext, task: ReanalyseTask) -> dict:
+    """Re-search stored positions with ``task.model``; new policy and search-value targets.
+
+    The stored record holds the root belief features but not the belief's
+    particles, so determinizations are drawn from the tile-conserving prior over
+    the observer's unseen tiles (an approximation; see docs/RACKZERO.md).
+    """
+    from rackzero.features import record_information
+
+    evaluator = ctx.evaluator(task.model)
+    rng = np.random.default_rng(task.seed)
+    search = Search(ctx.simulator, evaluator, SearchConfig(**task.search), rng)
+    count, width = task.records["policy"].shape
+    policy = np.zeros((count, width), dtype=np.float32)
+    value = np.zeros(count, dtype=np.float32)
+    started = time.perf_counter()
+    for i in range(count):
+        record = {name: array[i] for name, array in task.records.items()}
+        info, moves = record_information(record)
+        result = search.run(info, moves=moves, root_features=record["belief"])
+        policy[i, :len(result.policy)] = result.policy
+        value[i] = result.value
+    return {"policy": policy, "search_value": value,
+            "stats": {"positions": count, "seconds": time.perf_counter() - started}}
+
+
+@dataclass(frozen=True)
+class TeacherGameTask:
+    seed: int
+    candidates: int
+    max_turns: int
+    top: int = 10
+    temperature: float = 2.0     # soft target: softmax(equity / temperature); 0 = one-hot
+    shortlist: str = "mixed"
+
+
+def play_teacher_game(ctx: WorkerContext, task: TeacherGameTask) -> dict:
+    """One Quackle-vs-Quackle game -> records with Quackle policy targets.
+
+    Each decision's candidate set holds Quackle's ranked moves (up to half the
+    slots) plus the search shortlist, so the target is always representable.
+    """
+    from rackzero.features import belief_summary
+    from rackzero.search import shortlist
+
+    engine = ctx.quackle(task.top)
+    game_seq, belief_seq = np.random.SeedSequence(task.seed).spawn(2)
+    game = ctx.game
+    records, players = [], []
+    started = time.perf_counter()
+    agree = {"in_shortlist": 0, "score_shortlist": 0}
+    info = game.reset(seed=int(game_seq.generate_state(1)[0] % 2**31),
+                      rng=np.random.default_rng(belief_seq))
+    terminated = truncated = False
+    try:
+        for _ in range(task.max_turns):
+            obs = info.observation
+            moves = game.legal_moves()
+            ranked = engine.rank_legal(obs, moves)
+            short = shortlist(moves, task.candidates, obs, task.shortlist)
+            positions = {m: i for i, m in enumerate(moves)}
+            best = ranked[0][0]
+            agree["in_shortlist"] += any(positions[m] == best for m in short)
+            agree["score_shortlist"] += any(
+                positions[m] == best for m in shortlist(moves, task.candidates))
+            chosen = [i for i, _ in ranked[:max(1, task.candidates // 2)]]
+            for move in short:
+                if len(chosen) >= task.candidates:
+                    break
+                if positions[move] not in chosen:
+                    chosen.append(positions[move])
+            chosen.sort()
+            equity = {i: e for i, e in ranked}
+            target = np.zeros(task.candidates, dtype=np.float32)
+            slots = [k for k, i in enumerate(chosen) if i in equity]
+            values = np.array([equity[chosen[k]] for k in slots], dtype=np.float64)
+            if task.temperature > 0 and len(slots) > 1 and np.all(np.isfinite(values)):
+                weights = np.exp((values - values.max()) / task.temperature)
+                target[slots] = weights / weights.sum()
+            else:
+                target[chosen.index(best)] = 1.0
+            candidates = tuple(moves[i] for i in chosen)
+            record = encode_record(info, candidates, belief_summary(info, game.belief),
+                                   task.candidates)
+            record["policy"] = target
+            record["policy_weight"] = np.float32(1.0)
+            records.append(record)
+            players.append(int(obs["player"]))
+            info, terminated, truncated = game.step(moves[best].move)
+            if terminated or truncated:
+                break
+        natural = terminated and not truncated
+        scores = np.asarray(game.scores, dtype=np.float64)
+    finally:
+        game.close()
+    batch = None
+    if natural:
+        for record, player in zip(records, players):
+            margin = float(scores[player] - scores[1 - player])
+            record["win"] = np.float32(np.sign(margin))
+            record["margin"] = np.float32(margin)
+            record["search_value"] = record["win"]
+        batch = stack_records(records)
+    return {"records": batch, "stats": {
+        "games": 1, "natural_games": int(natural), "positions": len(records) if natural else 0,
+        "decisions": len(records), "seconds": time.perf_counter() - started,
+        "quackle_in_shortlist": agree["in_shortlist"],
+        "quackle_in_score_shortlist": agree["score_shortlist"]}}
+
+
+TASKS = {"selfplay": play_selfplay_game, "eval_game": play_evaluation_game,
+         "reanalyse": reanalyse_records, "teacher_game": play_teacher_game}
 
 
 # --------------------------------------------------------------------------- #
@@ -305,6 +462,8 @@ class Executor:
             self._pool = None
         if self._context is not None:
             self._context.simulator.close()
+            if self._context._quackle is not None:
+                self._context._quackle.close()
             self._context = None
 
 

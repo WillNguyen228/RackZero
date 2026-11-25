@@ -54,8 +54,8 @@ from rackzero.replay import ReplayBuffer
 from rackzero.stats import wilson_interval
 from rackzero.telemetry import HardwareMonitor, MetricsWriter, environment_report
 from rackzero.workers import (
-    Executor, InferenceServer, SelfPlayTask, WorkerSpec, evaluate_parallel, selfplay_seed,
-    write_model,
+    Executor, InferenceServer, ReanalyseTask, SelfPlayTask, WorkerSpec, evaluate_parallel,
+    selfplay_seed, write_model,
 )
 
 
@@ -124,20 +124,38 @@ def compute_losses(out: dict, batch: dict, training, value_head: str) -> dict:
     logits = out["logits"].float()
     log_probs = torch.log_softmax(logits, dim=-1).masked_fill(~mask, 0.0)
     target = batch["policy"]
-    policy_loss = -(target * log_probs).sum(-1).mean()
+    per_position = -(target * log_probs).sum(-1)
+    # Positions whose policy is not a training target (playout cap randomization's
+    # fast searches) have weight 0; records without the field weigh 1.
+    weight = batch.get("policy_weight")
+    if weight is None:
+        weight = torch.ones_like(per_position)
+    weight_sum = weight.sum().clamp_min(1.0)
+    policy_loss = (weight * per_position).sum() / weight_sum
     win = batch["win"]
+    q_weight = getattr(training, "value_target_q_weight", 0.0)
+    search_value = batch.get("search_value", win)
     if value_head == "wdl":
         classes = (1 - win).round().long().clamp(0, 2)  # win -> 0, draw -> 1, loss -> 2
-        value_loss = F.cross_entropy(out["wdl_logits"].float(), classes)
+        wdl_logits = out["wdl_logits"].float()
+        if q_weight:
+            soft = F.one_hot(classes, 3).float() * (1 - q_weight)
+            q = search_value.float().clamp(-1, 1)
+            soft[:, 0] += q_weight * (1 + q) / 2
+            soft[:, 2] += q_weight * (1 - q) / 2
+            value_loss = -(soft * torch.log_softmax(wdl_logits, -1)).sum(-1).mean()
+        else:
+            value_loss = F.cross_entropy(wdl_logits, classes)
     else:
-        value_loss = (out["value"].float() - win).square().mean()
+        value_target = win if not q_weight else (1 - q_weight) * win + q_weight * search_value
+        value_loss = (out["value"].float() - value_target).square().mean()
     margin_loss = (out["margin"].float() - batch["margin"] / training.margin_scale).square().mean()
     total = (training.policy_loss_weight * policy_loss + training.value_loss_weight * value_loss
              + training.margin_loss_weight * margin_loss)
     with torch.no_grad():
         probs = log_probs.exp().masked_fill(~mask, 0.0)
-        entropy = -(probs * log_probs).sum(-1).mean()
-        top1 = (logits.argmax(-1) == target.argmax(-1)).float().mean()
+        entropy = ((weight * -(probs * log_probs).sum(-1)).sum() / weight_sum)
+        top1 = (weight * (logits.argmax(-1) == target.argmax(-1)).float()).sum() / weight_sum
         value_mse = (out["value"].float() - win).square().mean()
     return {"total": total, "policy": policy_loss, "value": value_loss, "margin": margin_loss,
             "policy_entropy": entropy, "policy_top1": top1, "value_mse": value_mse}
@@ -205,6 +223,8 @@ class Trainer:
         (self.run_dir / "models").mkdir(exist_ok=True)
         if checkpoint is not None:
             self.restore(checkpoint, allow_config_change)
+        elif config.init_from:
+            self.initialize_from(config.init_from)
         with (self.run_dir / "config.yaml").open("w", encoding="utf-8") as handle:
             yaml.safe_dump(config.to_dict(), handle, sort_keys=False)
         report = environment_report(self.device)
@@ -291,6 +311,20 @@ class Trainer:
         self.counters.update(checkpoint["counters"])
         restore_rng(checkpoint["rng"], self.rng, allow_missing_cuda=allow_config_change)
 
+    def initialize_from(self, path) -> None:
+        """Start a new run from another checkpoint's network (e.g. a warm start).
+
+        Only the weights are copied: optimizer, replay, counters and RNG start fresh.
+        """
+        source = load_checkpoint(path)
+        if source["dictionary_fingerprint"] != self.lexicon.fingerprint:
+            raise ValueError("init_from checkpoint dictionary fingerprint does not match")
+        if asdict(self.config.model) != asdict(ModelConfig.from_dict(source["model_config"])):
+            raise ValueError("init_from checkpoint has a different model architecture; "
+                             "use the same model settings as the warm start")
+        self.model.load_state_dict(source["best_model"])
+        self.best_model = self._cpu_state()
+
     # -- workers ----------------------------------------------------------- #
 
     def _ensure_executor(self) -> Executor:
@@ -342,6 +376,8 @@ class Trainer:
             selfplay_seed(cfg.seed, self.iteration, i), ref, asdict(cfg.search),
             cfg.search.candidates, cfg.max_turns, cfg.selfplay.temperature,
             cfg.selfplay.temperature_moves, cfg.selfplay.final_temperature,
+            cfg.selfplay.full_search_probability, cfg.selfplay.fast_simulations,
+            cfg.selfplay.full_simulations,
         ) for i in range(cfg.selfplay.games_per_iteration)]
         started = time.perf_counter()
         results = executor.map("selfplay", tasks, self._progress("self-play"))
@@ -373,8 +409,9 @@ class Trainer:
             "inference_positions_per_second": (
                 totals.get("inference_positions", 0) / totals["inference_seconds"]
                 if totals.get("inference_seconds") else None),
-            "simulations_per_move": cfg.search.simulations,
+            "simulations_per_move": cfg.selfplay.full_simulations or cfg.search.simulations,
             "belief_resets": totals["belief_resets"],
+            "full_search_fraction": totals.get("full_searches", totals["plies"]) / plies,
             "workers": cfg.selfplay.workers,
         }
         if self.server is not None:
@@ -382,6 +419,36 @@ class Trainer:
         self.counters["selfplay_games"] += totals["games"]
         self.counters["selfplay_positions"] += totals["positions"]
         return stats
+
+    def reanalyse(self, new_positions: int) -> dict | None:
+        """Refresh policy/search-value targets of stored positions with the current network."""
+        cfg = self.config
+        count = min(len(self.replay), int(round(cfg.reanalyse.fraction * new_positions)))
+        if count < 1:
+            return None
+        from rackzero.evaluation import evaluation_search_config
+        slots = self.rng.choice(len(self.replay), size=count, replace=False)
+        ref = self._publish("reanalyse", self._cpu_state())
+        search = asdict(evaluation_search_config(cfg.search))
+        per = cfg.reanalyse.positions_per_task
+        chunks = [slots[i:i + per] for i in range(0, count, per)]
+        tasks = [ReanalyseTask(int(np.random.SeedSequence([cfg.seed, self.iteration, 11, i])
+                                   .generate_state(1)[0] % 2**31),
+                               ref, search, self.replay.positions(chunk))
+                 for i, chunk in enumerate(chunks)]
+        started = time.perf_counter()
+        results = self._ensure_executor().map("reanalyse", tasks, self._progress("reanalyse"))
+        changed = 0.0
+        for chunk, result in zip(chunks, results):
+            old = self.replay.arrays["policy"][chunk]
+            changed += float(0.5 * np.abs(old - result["policy"]).sum())
+            self.replay.update(chunk, {"policy": result["policy"],
+                                       "search_value": result["search_value"],
+                                       "policy_weight": np.ones(len(chunk), dtype=np.float32)})
+        wall = time.perf_counter() - started
+        return {"positions": count, "wall_seconds": wall,
+                "seconds_per_position": sum(r["stats"]["seconds"] for r in results) / count,
+                "mean_policy_change": changed / count}
 
     def training_steps(self, new_positions: int) -> int:
         cfg = self.config.training
@@ -478,6 +545,11 @@ class Trainer:
         with monitor:
             selfplay = self.self_play()
         hardware = {"selfplay": monitor.summary()}
+        reanalysed = None
+        if cfg.reanalyse.fraction > 0:
+            with monitor:
+                reanalysed = self.reanalyse(selfplay.get("new_positions", 0))
+            hardware["reanalyse"] = monitor.summary()
         with monitor:
             training = self.optimize(selfplay.get("new_positions"))
         hardware["training"] = monitor.summary()
@@ -487,6 +559,8 @@ class Trainer:
                 training["steps"] * training["batch_size"] / selfplay["new_positions"])
         record = {"iteration": number, "selfplay": selfplay, "training": training,
                   "loss": training.get("loss"), "replay_size": len(self.replay)}
+        if reanalysed is not None:
+            record["reanalyse"] = reanalysed
         candidate_ref = None
         arena = None
         run_arena = cfg.arena.mode == "gate" or (
@@ -541,6 +615,9 @@ def summary_line(record: dict) -> str:
     parts = [f"[iter {record['iteration']}]",
              f"selfplay {sp['games']}g/{sp['new_positions']}pos "
              f"{sp['games_per_hour']:.0f}g/h {sp['decision_seconds_mean']:.2f}s/move"]
+    if record.get("reanalyse"):
+        ra = record["reanalyse"]
+        parts.append(f"reanalyse {ra['positions']}pos {ra['wall_seconds']:.0f}s")
     if not tr.get("skipped"):
         parts.append(f"loss {tr['loss']:.3f} (p {tr['policy_loss']:.3f} v {tr['value_loss']:.3f} "
                      f"m {tr['margin_loss']:.3f}) {tr['samples_per_second']:.0f} samples/s")

@@ -85,13 +85,33 @@ def public_event(obs: dict, move: Move, score: int) -> PublicEvent:
                        move if move.kind != "exchange" else None)
 
 
+def premium_multipliers() -> tuple[np.ndarray, np.ndarray]:
+    """Letter and word multipliers of the Java board layout (15x15 each)."""
+    layout = jpype.JClass("com.masterchiefproject.scrabble.game.Board")()
+    premiums = [[layout.premiumAt(r, c) for c in range(15)] for r in range(15)]
+    return (np.array([[p.letterMultiplier() for p in row] for row in premiums]),
+            np.array([[p.wordMultiplier() for p in row] for row in premiums]))
+
+
 class Game:
-    """Only this coordinator owns the actual live hidden state."""
+    """Only this coordinator owns the actual live hidden state.
+
+    ``movegen="fast"`` lists legal moves with the cached Python generator
+    (bit-identical to the Java-preview generator; tested). Moves are still
+    played, validated and scored by the Java engine.
+    """
 
     def __init__(self, words: frozenset[str], max_turns: int = 200,
                  particles: int = 32, rng: np.random.Generator | None = None,
-                 belief_likelihood=None):
+                 belief_likelihood=None, movegen: str = "reference"):
+        if movegen not in ("fast", "reference"):
+            raise ValueError("movegen must be fast or reference")
         self._env = ScrabbleEnv(words=words, max_turns=max_turns)
+        self._movegen = movegen
+        self._board_cache = None
+        if movegen == "fast":
+            from rackzero.game.movegen import BoardCache
+            self._board_cache = BoardCache(self._env.words, *premium_multipliers())
         self.history: tuple[PublicEvent, ...] = ()
         self._particles = particles
         self._rng = rng if rng is not None else np.random.default_rng(0)
@@ -135,7 +155,12 @@ class Game:
         return self._beliefs[self._env._player]
 
     def legal_moves(self) -> tuple[ScoredMove, ...]:
-        return self._env.legal_moves()
+        if self._movegen == "reference":
+            return self._env.legal_moves()
+        from rackzero.game.movegen import generate
+        obs = self._env._observation()
+        return generate(obs["board"], obs["board_blanks"], obs["rack"], int(obs["bag_size"]),
+                        self._env._trie, self._board_cache)
 
     @property
     def scores(self) -> np.ndarray:
@@ -209,10 +234,7 @@ class Simulator:
             raise ValueError(f"movegen must be one of {self.MOVEGENS}")
         self._template = ScrabbleEnv(words=words, max_turns=max_turns)
         self._Tile = jpype.JClass("com.masterchiefproject.scrabble.game.Tile")
-        layout = jpype.JClass("com.masterchiefproject.scrabble.game.Board")()
-        premiums = [[layout.premiumAt(r, c) for c in range(15)] for r in range(15)]
-        self._letter_mult = np.array([[p.letterMultiplier() for p in row] for row in premiums])
-        self._word_mult = np.array([[p.wordMultiplier() for p in row] for row in premiums])
+        self._letter_mult, self._word_mult = premium_multipliers()
         self.movegen = movegen
         self.stats = {"movegen_calls": 0, "movegen_seconds": 0.0,
                       "step_calls": 0, "step_seconds": 0.0}

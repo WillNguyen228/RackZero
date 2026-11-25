@@ -222,7 +222,8 @@ def bench_search(args, words, results):
     emit(results, args.output, {
         "benchmark": "search", "config": str(args.config), "method": search_config.method,
         "simulations": search_config.simulations, "depth": search_config.depth,
-        "candidates": search_config.candidates, "model": config.model.arch,
+        "candidates": search_config.candidates, "shortlist": search_config.shortlist,
+        "root_selection": search_config.root_selection, "model": config.model.arch,
         "params": parameter_count(model), "decisions": len(positions),
         "seconds_per_decision": seconds / len(positions),
         "movegen_fraction": movegen / seconds, "inference_fraction": inference / seconds,

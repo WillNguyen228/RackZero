@@ -123,6 +123,31 @@ sbatch --account=$ACCT --partition=gpuA100x4 --time=24:00:00 --cpus-per-task=32 
   scripts/delta/train.sbatch configs/large.yaml
 ```
 
+### Warm-started run (Quackle pre-training)
+
+Quackle is built only on your own computer, so generate the teacher data and
+pre-train there (see RACKZERO.md, "Warm start and training improvements").
+Then copy the pre-trained run directory to Delta, about 10 MB. Run this on your
+computer, from the repository root:
+
+```bash
+scp -r runs/<warm-pretrain-run> <user>@dt-login01.delta.ncsa.illinois.edu:<DEST>/Scrabble/runs/
+```
+
+On Delta, start self-play from it. The dictionary (WOW24v3.zip) and model
+settings must match the pre-training:
+
+```bash
+sbatch --account=$ACCT --partition=gpuA100x4 --time=12:00:00 \
+  --export=ALL,RACKZERO_ACTIVATE="$ACTIVATE" \
+  scripts/delta/train.sbatch configs/warm.yaml \
+  --set init_from=runs/<warm-pretrain-run>/checkpoints/pretrained.pt
+```
+
+Do not put `quackle` in `evaluation.opponents` for a Delta run unless Quackle
+is built there. Evaluate against Quackle on your computer instead, using the
+checkpoints copied back with `scripts/delta/pull_runs.sh`.
+
 Any setting can be appended as `--set key=value`; see
 [SCALING_PLAN.md](SCALING_PLAN.md) for the one-factor experiments. Each run
 creates `runs/<name>-<timestamp>/`. The job log

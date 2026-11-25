@@ -1,0 +1,25 @@
+# Warm-started RackZero on one A100 (see docs/RACKZERO.md, "Warm start and
+# training improvements"). Same network and budget as gpu.yaml, plus:
+#   - init_from: a network pre-trained on Quackle's moves (set on the command
+#     line: --set init_from=runs/<pretrain-run>/checkpoints/pretrained.pt)
+#   - exploration fix (inherited from base.yaml): root Dirichlet noise and
+#     temperature 1 only for the first 8 plies
+#   - mixed shortlist: half the candidates by score, half by score + leave, so
+#     the leave-motivated moves the warm start learned can actually be played
+#   - playout cap randomization: 25% of moves get a 64-simulation search that
+#     becomes a policy target, the rest a 16-simulation search (value targets
+#     only); about 28 simulations per move on average vs 32 before.
+#     search.simulations stays 32, so evaluation and the arena match gpu.yaml
+#   - value target = 0.5 * outcome + 0.5 * search value
+# Gumbel root search and Reanalyse are implemented but off here; enable them
+# with --set as one-factor experiments (docs/SCALING_PLAN.md rows 16-17).
+extends: gpu.yaml
+name: warm
+search:
+  shortlist: mixed
+selfplay:
+  full_search_probability: 0.25
+  full_simulations: 64
+  fast_simulations: 16
+training:
+  value_target_q_weight: 0.5

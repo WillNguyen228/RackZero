@@ -8,6 +8,7 @@ iterations: 20
 output_root: runs
 dictionary: WOW24v3.zip      # user-supplied; not redistributed (see docs/RACKZERO.md)
 max_turns: 200               # safety cutoff only; truncated games yield no targets
+init_from: null              # new runs: start from this checkpoint's network (warm start)
 
 runtime:
   device: auto               # auto | cpu | cuda
@@ -38,12 +39,20 @@ search:
   method: ismcts             # stochastic | pimc | ismcts | belief | neural_determinization
   simulations: 32
   depth: 2
-  candidates: 16             # top-score shortlist (+ pass + largest exchange)
+  candidates: 16             # shortlist size (+ pass + largest exchange)
+  shortlist: score           # score (top scores) | mixed (half by score, half by score + leave)
   exploration: 1.5
   particles: 32
-  root_noise_alpha: 0.0      # self-play only; 0 = off (original behaviour)
-  root_noise_fraction: 0.0
+  # AlphaZero root exploration (self-play only; evaluation never uses it).
+  # Before 2026-11-25 the default was off (0.0 / 0.0).
+  root_noise_alpha: 0.3
+  root_noise_fraction: 0.25
   movegen: fast              # fast (bit-identical, cached) | reference
+  root_selection: puct       # puct (visit counts) | gumbel (Gumbel AlphaZero)
+  gumbel_actions: 16         # gumbel: actions sampled at the root (sequential halving)
+  gumbel_c_visit: 50.0
+  gumbel_c_scale: 1.0
+  gumbel_scale: 1.0          # gumbel noise in self-play (evaluation uses 0)
 
 selfplay:
   games_per_iteration: 32
@@ -54,8 +63,16 @@ selfplay:
   inference_max_wait_ms: 2.0
   inference_precision: fp32
   temperature: 1.0           # move sampling temperature over visit counts
-  temperature_moves: null    # null = whole game; else plies before final_temperature
+  # Sample at temperature 1 for the first 8 plies, then play the most-visited
+  # move (AlphaZero). Before 2026-11-25 the default was null (whole game at 1.0).
+  temperature_moves: 8
   final_temperature: 0.0
+  # Playout cap randomization (KataGo): a move is a full search with this
+  # probability (policy target), else a fast search of fast_simulations
+  # (value target only). 1.0 = off.
+  full_search_probability: 1.0
+  fast_simulations: null
+  full_simulations: null     # self-play full-search budget (null = search.simulations)
 
 replay:
   capacity: 100000
@@ -84,6 +101,11 @@ training:
   value_loss_weight: 1.0
   margin_loss_weight: 1.0
   margin_scale: 100.0
+  value_target_q_weight: 0.0 # value target = (1-w)*outcome + w*search value; 0 = outcome only
+
+reanalyse:
+  fraction: 0.0              # re-search fraction x new positions per iteration; 0 = off
+  positions_per_task: 8
 
 arena:
   mode: monitor              # gate (promote/roll back) | monitor (report only) | off

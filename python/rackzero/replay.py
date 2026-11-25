@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from rackzero.features import RECORD_FIELDS, TARGET_FIELDS, field_shape
+from rackzero.features import RECORD_FIELDS, TARGET_FIELDS, field_shape, fill_target_defaults
 
 
 FIELDS = {**RECORD_FIELDS, **TARGET_FIELDS}
@@ -39,6 +39,7 @@ class ReplayBuffer:
         count = len(batch["policy"])
         if not count:
             return
+        batch = fill_target_defaults(batch)
         if set(batch) != set(FIELDS):
             raise ValueError(f"Replay batch fields differ: {sorted(set(FIELDS) ^ set(batch))}")
         if count > self.capacity:
@@ -60,6 +61,17 @@ class ReplayBuffer:
             raise RuntimeError("No replay positions available")
         index = rng.integers(0, self.size, size=batch_size)
         return {name: array[index] for name, array in self.arrays.items()}
+
+    def positions(self, slots: np.ndarray) -> dict[str, np.ndarray]:
+        """Copies of the records stored in ``slots`` (indices into the ring)."""
+        return {name: array[slots].copy() for name, array in self.arrays.items()}
+
+    def update(self, slots: np.ndarray, values: dict[str, np.ndarray]) -> None:
+        """Overwrite target fields of stored records (Reanalyse)."""
+        for name, value in values.items():
+            if name not in TARGET_FIELDS:
+                raise ValueError(f"Only target fields can be updated, not {name!r}")
+            self.arrays[name][slots] = value
 
     def ordered(self) -> dict[str, np.ndarray]:
         """Stored records, oldest first."""

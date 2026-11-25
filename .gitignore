@@ -37,6 +37,8 @@ __pycache__/
 /WOW24v3.zip
 /checkpoints/
 /runs/
+# Generated warm-start datasets (python -m rackzero.warmstart generate)
+/data/
 
 # Independently licensed upstream source checkouts
 /third_party/quackle/

@@ -77,6 +77,15 @@ class SelfPlayConfig:
     temperature: float = 1.0
     temperature_moves: int | None = None   # plies using `temperature`; None = whole game
     final_temperature: float = 0.0
+    # Playout cap randomization (KataGo, Wu 2019): each move is a full search
+    # (full_simulations, root noise, recorded as a policy target) with this
+    # probability, otherwise a fast search (fast_simulations, no noise, used only
+    # for value targets). 1.0 = every move is a full search (original).
+    full_search_probability: float = 1.0
+    fast_simulations: int | None = None
+    # Self-play full-search budget; None = search.simulations. Evaluation and the
+    # arena always use search.simulations, so results stay comparable.
+    full_simulations: int | None = None
 
     def __post_init__(self):
         _positive_int("selfplay", "games_per_iteration", self.games_per_iteration)
@@ -92,6 +101,15 @@ class SelfPlayConfig:
         _finite("selfplay", "final_temperature", self.final_temperature, 0)
         if self.temperature_moves is not None:
             _positive_int("selfplay", "temperature_moves", self.temperature_moves, 0)
+        _finite("selfplay", "full_search_probability", self.full_search_probability, 0, 1)
+        if self.full_search_probability <= 0:
+            raise ValueError("selfplay.full_search_probability must be positive")
+        if self.full_search_probability < 1 and self.fast_simulations is None:
+            raise ValueError("selfplay.full_search_probability < 1 requires selfplay.fast_simulations")
+        if self.fast_simulations is not None:
+            _positive_int("selfplay", "fast_simulations", self.fast_simulations)
+        if self.full_simulations is not None:
+            _positive_int("selfplay", "full_simulations", self.full_simulations)
 
 
 @dataclass
@@ -126,6 +144,9 @@ class TrainingConfig:
     value_loss_weight: float = 1.0
     margin_loss_weight: float = 1.0
     margin_scale: float = 100.0       # margin target = final score difference / margin_scale
+    # Value target = (1 - w) * game outcome z + w * search root value q (as in
+    # Leela Chess Zero / KataGo). 0 = outcome only (original).
+    value_target_q_weight: float = 0.0
 
     def __post_init__(self):
         for name in ("steps_per_iteration", "batch_size", "min_replay", "lr_step_size"):
@@ -148,8 +169,22 @@ class TrainingConfig:
         _finite("training", "lr_min_factor", self.lr_min_factor, 0, 1)
         _finite("training", "lr_gamma", self.lr_gamma, 0, 1)
         _finite("training", "margin_scale", self.margin_scale)
+        _finite("training", "value_target_q_weight", self.value_target_q_weight, 0, 1)
         if self.margin_scale <= 0:
             raise ValueError("training.margin_scale must be positive")
+
+
+@dataclass
+class ReanalyseConfig:
+    # Reanalyse (MuZero Reanalyse, Schrittwieser et al. 2021): each iteration,
+    # re-search fraction x new_positions stored positions with the current
+    # network and replace their policy (and search-value) targets. 0 = off.
+    fraction: float = 0.0
+    positions_per_task: int = 8
+
+    def __post_init__(self):
+        _finite("reanalyse", "fraction", self.fraction, 0)
+        _positive_int("reanalyse", "positions_per_task", self.positions_per_task)
 
 
 @dataclass
@@ -188,7 +223,7 @@ class EvaluationConfig:
             _positive_int("evaluation", "games", self.games, 2)
             if self.games % 2:
                 raise ValueError("evaluation.games must be even for paired seats")
-        allowed = {"random", "greedy", "heuristic"}
+        allowed = {"random", "greedy", "heuristic", "quackle"}
         if not isinstance(self.opponents, list) or not set(self.opponents) <= allowed:
             raise ValueError(f"evaluation.opponents must be a list drawn from {sorted(allowed)}")
         _positive_int("evaluation", "seed", self.seed, 0)
@@ -216,7 +251,7 @@ class LoggingConfig:
 SECTIONS = {
     "runtime": RuntimeConfig, "model": ModelConfig, "search": SearchConfig,
     "selfplay": SelfPlayConfig, "replay": ReplayConfig, "training": TrainingConfig,
-    "arena": ArenaConfig, "evaluation": EvaluationConfig, "checkpoint": CheckpointConfig,
+    "reanalyse": ReanalyseConfig, "arena": ArenaConfig, "evaluation": EvaluationConfig, "checkpoint": CheckpointConfig,
     "logging": LoggingConfig,
 }
 
@@ -229,12 +264,16 @@ class Config:
     output_root: str = "runs"
     dictionary: str | None = "WOW24v3.zip"
     max_turns: int = 200
+    # Initial network weights for a new run (e.g. a Quackle warm start from
+    # ``python -m rackzero.warmstart pretrain``). Ignored when resuming.
+    init_from: str | None = None
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
     selfplay: SelfPlayConfig = field(default_factory=SelfPlayConfig)
     replay: ReplayConfig = field(default_factory=ReplayConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    reanalyse: ReanalyseConfig = field(default_factory=ReanalyseConfig)
     arena: ArenaConfig = field(default_factory=ArenaConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
@@ -248,6 +287,8 @@ class Config:
         _positive_int("config", "max_turns", self.max_turns)
         if not isinstance(self.output_root, str) or not self.output_root:
             raise ValueError("output_root must be a nonempty path")
+        if self.init_from is not None and not isinstance(self.init_from, str):
+            raise ValueError("init_from must be a checkpoint path or null")
         if self.dictionary is not None and not isinstance(self.dictionary, str):
             raise ValueError("dictionary must be a path or null (built-in tiny lexicon)")
         if self.selfplay.inference == "server" and self.selfplay.workers < 1:
@@ -403,7 +444,7 @@ def load_config(path: str | Path, overrides: list[str] | None = None) -> Config:
 # Settings that change throughput or reporting but not the training trajectory
 # (self-play games are seeded per game, so worker count cannot change results).
 RESUME_NEUTRAL = {
-    "iterations", "name", "output_root",
+    "iterations", "name", "output_root", "init_from",
     "runtime.threads",
     "selfplay.workers", "selfplay.worker_threads",
     "logging", "checkpoint", "evaluation",
@@ -428,8 +469,12 @@ def flatten(values: dict, prefix: str = "") -> dict:
 
 
 def config_differences(old: dict, new: dict) -> dict[str, tuple]:
+    """Changed settings. A setting absent from ``old`` (saved before it existed)
+    is unchanged if ``new`` holds its default, which reproduces the old behaviour."""
     a, b = flatten(old), flatten(new)
-    return {k: (a.get(k), b.get(k)) for k in sorted(set(a) | set(b)) if a.get(k) != b.get(k)}
+    defaults = flatten(Config().to_dict())
+    return {k: (a.get(k), b.get(k)) for k in sorted(set(a) | set(b))
+            if a.get(k) != b.get(k) and not (k not in a and b.get(k) == defaults.get(k))}
 
 
 def classify_resume_change(key: str) -> str:

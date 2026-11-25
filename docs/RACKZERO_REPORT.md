@@ -221,3 +221,104 @@ Judge every experiment with 200–400 game evaluations and head-to-head matches
 * Policy targets cover the shortlisted candidates (top scores plus pass and
   the largest exchange), as before. Low-scoring strategic moves outside the
   shortlist cannot be learned. Raising `search.candidates` is an experiment.
+
+## 8. Warm start and training improvements (2026-11-25)
+
+### What was added
+
+All of these are config switches and documented in RACKZERO.md, "Warm start
+and training improvements".
+
+* **Exploration fix (on by default for new runs):** root Dirichlet noise
+  (α 0.3, ε 0.25) and temperature 1 for only the first 8 plies.
+  * Earlier runs sampled every move at temperature 1, with no noise.
+  * Resumed runs keep their saved settings.
+* **Quackle warm start:**
+  * `native/quackle/main.cpp` gained `--serve` (one process for many
+    positions: 0.014 s per call, against 0.38 s for one-shot) and `--top N`
+    with equities. The one-shot output is unchanged.
+  * `rackzero.quackle` wraps it as a teacher and as an evaluation opponent.
+  * `python -m rackzero.warmstart generate | pretrain`; `init_from` starts a
+    run from the pre-trained network.
+* **Mixed shortlist** (`search.shortlist: mixed`).
+* **Playout cap randomization** (`selfplay.full_search_probability`,
+  `full_simulations`, `fast_simulations`); fast-search positions get
+  `policy_weight` 0.
+* **Gumbel AlphaZero root search** (`search.root_selection: gumbel`).
+* **q/z value target** (`training.value_target_q_weight`); records now store
+  the search value.
+* **Reanalyse** (`reanalyse.fraction`), with records decoded back into
+  positions (`features.record_information`, tested as an exact round trip).
+* **Live move generation:** `Game(movegen="fast")` lists the live game's moves
+  with the cached generator.
+  * Identical to Java's list on every turn of whole games (tested).
+  * Java still validates and scores every move that is played.
+* **`configs/warm.yaml`** combines the warm start, the mixed shortlist, playout
+  cap randomization (25% × 64 simulations, 75% × 16) and a 0.5 q/z value
+  target. `search.simulations` stays 32, so its evaluations match `gpu.yaml`.
+
+Bug fixed: `evaluate.py --device cpu` rejected checkpoints trained with
+`runtime.precision: bf16`. Evaluation now uses fp32 on the CPU, and a
+regression test covers it.
+
+### Measurements (laptop: 8 CPU workers; RTX 4070 for pre-training)
+
+* **Teacher data:** 4,000 Quackle-vs-Quackle games, 98,857 positions, 19 min.
+* **Shortlist coverage:** Quackle's move was in the top-16-by-score shortlist
+  84.3% of the time and in the mixed shortlist 88.3%.
+* **Mixed shortlist cost:** about 10% more time per search decision
+  (1.19 → 1.31 s, 32 simulations, 12 positions).
+* **Live move generation on this Windows laptop:** about 1 s per decision with
+  the Java-preview generator, against 0.035 s with the fast one. A Quackle
+  teacher game went from 27.7 s to 2.1 s.
+  * The Delta run spent only 0.11–0.14 s per live decision (about 7% of
+    self-play), so the gain there is small.
+* **Pre-training** (medium network, 10 policy epochs + 2 joint epochs, about
+  2 min on GPU). On 247 held-out games:
+  * top move agrees with Quackle 87.7%;
+  * value loss 0.68, margin loss 0.53.
+  * Jointly trained value heads memorize games: validation value loss rose
+    from 0.69 to 0.91 over 10 epochs, even at value weight 0.05. Fitting only
+    the heads on the frozen trunk reached just 0.87. Hence the two-phase
+    procedure with best-epoch selection.
+
+**Strength:** 200 games each, paired seeds with swapped seats, seed 5000
+(head-to-head: seed 7000), 32-simulation ISMCTS, PUCT unless stated, no noise.
+
+| Network | vs greedy | vs heuristic | vs Quackle static |
+|---|---|---|---|
+| Self-play `gpu-20261124-235040`, iteration 20 | 0.323 [0.262, 0.390], −67.0 | 0.330 [0.269, 0.398], −70.6 | 0.240 [0.186, 0.304], −91.5 |
+| Quackle warm start (no self-play yet) | **0.693** [0.625, 0.752], +42.0 | **0.583** [0.513, 0.649], +22.3 | **0.588** [0.518, 0.653], +9.8 [−4.7, +24.4] |
+| Warm start, Gumbel root (same 32 simulations) | — | 0.578 [0.508, 0.644], +4.2 | — |
+
+* **Head-to-head:** the warm start (mixed shortlist) against iteration 20
+  (score shortlist) won **0.782 [0.720, 0.834]**, margin +98.5
+  [+81.4, +115.6].
+* **One `warm.yaml` iteration** from the warm start on WOW24 (8 workers,
+  32 games):
+  * 427 games/hour, 2.2 s per move, 24.9% full searches;
+  * Reanalyse of 78 positions took 34 s and changed their policy targets by
+    0.14 on average (total-variation distance);
+  * 40 games against the heuristic: 0.55 [0.40, 0.69].
+
+### What these results show, and what they do not
+
+* The warm start is clearly stronger than 20 iterations of self-play from
+  scratch, and stronger than both hand-written baselines. Its win-rate interval
+  against Quackle's static player lies just above 0.5; the margin interval
+  includes 0.
+* With search on top of an imitation policy, RackZero plays roughly at the
+  level of the static player it imitated. That is the expected starting point
+  for self-play.
+* **Gumbel at test time** did not improve play at 32 simulations: the win
+  rate was the same and the margin was lower. Its claimed benefit is better
+  *training targets* at small budgets, which this test does not measure.
+* **Not measured yet:** whether self-play from the warm start keeps improving,
+  and the separate effect of playout cap randomization, the q/z target,
+  Reanalyse and Gumbel *in training*. Those are SCALING_PLAN rows 16–21 and
+  need Delta-scale runs.
+* **Risk to watch:** the first self-play iterations train on a small replay
+  buffer (783 positions after iteration 1) at a replay ratio of 8. That could
+  pull the network away from the warm start. If the in-training evaluation
+  drops below the warm start's own numbers, lower `training.learning_rate` or
+  `training.samples_per_position` for the first iterations.

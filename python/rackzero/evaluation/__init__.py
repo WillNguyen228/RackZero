@@ -23,7 +23,7 @@ from rackzero.search import METHODS, Search, SearchConfig
 from rackzero.stats import mean_interval, wilson_interval
 
 
-OPPONENTS = ("random", "greedy", "heuristic", "neural", "search")
+OPPONENTS = ("random", "greedy", "heuristic", "neural", "search", "quackle")
 
 
 def evaluation_search_config(search_config: SearchConfig | None, method: str | None = None):
@@ -31,6 +31,7 @@ def evaluation_search_config(search_config: SearchConfig | None, method: str | N
     if method is not None:
         values["method"] = method
     values["root_noise_fraction"] = 0.0
+    values["gumbel_scale"] = 0.0      # Gumbel root: deterministic action choice
     return SearchConfig(**values)
 
 
@@ -41,8 +42,10 @@ def _belief_input(model, info, belief):
 
 
 def play_game(words, simulator, model, baseline, opponent, config, opponent_config,
-              max_turns, game_seed, seat, game_factory=None):
+              max_turns, game_seed, seat, game_factory=None, quackle=None):
     """One evaluation game with the evaluated agent in ``seat``.
+
+    ``quackle`` is a ``rackzero.quackle.QuackleEngine`` (opponent "quackle").
 
     Returns the per-game result dict, or None if the game was truncated.
     """
@@ -53,7 +56,8 @@ def play_game(words, simulator, model, baseline, opponent, config, opponent_conf
                 for player in (0, 1)]
     belief_rng = np.random.default_rng(np.random.SeedSequence([game_seed, 2]))
     if game_factory is None:
-        game = Game(words, max_turns=max_turns, particles=config.particles, rng=belief_rng)
+        game = Game(words, max_turns=max_turns, particles=config.particles, rng=belief_rng,
+                    movegen=config.movegen)
     else:
         game = game_factory(config.particles, belief_rng)
     regret = 0.0
@@ -66,7 +70,13 @@ def play_game(words, simulator, model, baseline, opponent, config, opponent_conf
             moves = game.legal_moves()
             if player == seat or opponent == "search":
                 result = searches[player].run(info, moves=moves, belief=game.belief)
-                move = result.moves[int(np.argmax(result.policy))].move
+                index = (result.selected if result.selected is not None
+                         else int(np.argmax(result.policy)))
+                move = result.moves[index].move
+            elif opponent == "quackle":
+                if quackle is None:
+                    raise ValueError("The quackle opponent needs a QuackleEngine")
+                move = moves[quackle.choose(info.observation, moves)].move
             elif opponent == "neural":
                 policy = baseline.predict(info, moves,
                                           _belief_input(baseline, info, game.belief))[0]
@@ -103,10 +113,10 @@ def pair_up(games: list) -> list:
 
 
 def play_pair(words, simulator, model, baseline, opponent, config, opponent_config,
-              max_turns, game_seed, game_factory=None):
+              max_turns, game_seed, game_factory=None, quackle=None):
     """Play one seed in both seats. Returns (per-game dicts or None, truncated count)."""
     games = [play_game(words, simulator, model, baseline, opponent, config, opponent_config,
-                       max_turns, game_seed, seat, game_factory) for seat in (0, 1)]
+                       max_turns, game_seed, seat, game_factory, quackle) for seat in (0, 1)]
     return pair_up([games])[0]
 
 
@@ -181,18 +191,24 @@ def evaluate_model(
     model.eval()
     baseline.eval()
     simulator = Simulator(words, max_turns=max_turns, movegen=config.movegen)
+    quackle = None
+    if opponent == "quackle":
+        from rackzero.quackle import QuackleEngine
+        quackle = QuackleEngine(words)
     started = time.perf_counter()
     pairs = []
     try:
         for index, game_seed in enumerate(seeds):
             pairs.append(play_pair(words, simulator, model, baseline, opponent, config,
-                                   opponent_config, max_turns, game_seed))
+                                   opponent_config, max_turns, game_seed, quackle=quackle))
             if progress:
                 kept = sum(2 for pair, _ in pairs if pair is not None)
                 print(f"evaluation {2 * (index + 1)}/{games}: retained={kept}, "
                       f"discarded={2 * (index + 1) - kept}", flush=True)
     finally:
         simulator.close()
+        if quackle is not None:
+            quackle.close()
     return summarize(pairs, method=method, opponent=opponent, seed=seed, games=games,
                      seconds=time.perf_counter() - started)
 
@@ -261,11 +277,18 @@ def main(argv=None):
     config = Config.from_dict(values)
     if args.device:
         config.runtime.device = args.device
+    if resolve_device(config.runtime.device) == "cpu":
+        # runtime.precision is training autocast; evaluation inference is fp32
+        # on the CPU, so a GPU-trained (bf16) checkpoint can be evaluated there.
+        config.runtime.precision = "fp32"
     configure_runtime(config)
     device = resolve_device(config.runtime.device) if args.workers == 0 else "cpu"
     lexicon = lexicon_for(config)
     if checkpoint["dictionary_fingerprint"] != lexicon.fingerprint:
         raise ValueError("Checkpoint dictionary fingerprint does not match")
+    if "quackle" in opponents:
+        from rackzero.quackle import lexicon_dawg
+        lexicon_dawg(lexicon.words)   # build once here, not concurrently in every worker
     which = "model" if args.use_current else "best_model"
     model = model_from_checkpoint(checkpoint, which)
     opponent_model = None

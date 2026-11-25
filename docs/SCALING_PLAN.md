@@ -15,11 +15,15 @@ prints the differing settings).
 | Setting | Baseline value |
 |---|---|
 | network | `resnet`, 64 channels x 6 blocks, latent 256 (0.80M parameters) |
-| search | `ismcts`, 32 simulations, depth 2, 16 candidates, 32 particles, no root noise |
-| self-play | 64 games/iteration, temperature 1.0 for the whole game |
+| search | `ismcts`, 32 simulations, depth 2, 16 candidates (top scores), 32 particles, root Dirichlet noise α 0.3 / ε 0.25 |
+| self-play | 64 games/iteration, temperature 1.0 for 8 plies, then the most-visited move |
 | replay / training | 200k positions; 8 gradient samples per new position (≈60 steps x batch 256 per iteration); Adam lr 1e-3, wd 1e-4, constant LR |
 | arena | `monitor` (always accept; candidate vs previous every 2 iterations, 40 games) |
 | evaluation | every 2 iterations, 40 games each vs `greedy` and `heuristic`, seed 1000 |
+
+Runs started before 2026-11-25 (for example `gpu-20261124-235040`) used no
+root noise and temperature 1.0 for the whole game. Treat the change as row 11
+and do not mix those runs into comparisons against the new baseline.
 
 Before any comparison, run the baseline **with three training seeds**
 (`--set seed=1`, `2`, `3`). The spread between them is the noise floor that
@@ -72,14 +76,22 @@ inform the later ones.
 | 8b | Replay ratio | 2, 4, **8**, 16 samples per new position | `training.samples_per_position=N` | Too high memorizes (value loss collapses; watch `samples_per_new_position` and the baseline curve). Too low wastes self-play data. |
 | 9 | Replay capacity | 50k, **200k**, 800k | `replay.capacity=N` | Staleness vs diversity. |
 | 10 | Search method | **ismcts**, belief, pimc, neural_determinization, stochastic | `search.method=M` | Use `evaluate.py --compare-methods` on one trained checkpoint first; it is cheap. |
-| 11 | Exploration | **off**, root noise α=0.3/ε=0.25; temperature 1 → 0 after 8 plies | `search.root_noise_alpha=0.3 search.root_noise_fraction=0.25`; `selfplay.temperature_moves=8` | Standard AlphaZero exploration. The baseline samples at temperature 1 throughout. |
+| 11 | Exploration | off (old runs), **noise α=0.3/ε=0.25 + temperature 1 → 0 after 8 plies** | `search.root_noise_fraction=0 selfplay.temperature_moves=null` reproduces the old setting | Standard AlphaZero exploration; now the baseline. |
 | 12 | Value target | **scalar**, wdl | `model.value_head=wdl` | Draws are rare in Scrabble, so expect little difference. |
 | 13 | Architecture | **resnet**, cnn, legacy_mlp | `model.arch=A` | Does the spatial, move-pooling policy beat the original MLP? |
 | 14 | Promotion | **monitor**, gate (80 games, wilson) | `arena.mode=gate arena.games=80 arena.criterion=wilson` | Gating with small arenas mostly rejects for noise. |
 | 15 | LR schedule | **constant**, cosine with warmup | `training.lr_schedule=cosine training.warmup_steps=500` | |
+| 16 | Gumbel root search | **puct**, gumbel | `search.root_selection=gumbel` | Gumbel AlphaZero keeps improving the policy with few simulations. Compare at 16 and 32 simulations. |
+| 17 | Reanalyse | **0**, 0.25, 0.5 | `reanalyse.fraction=F` | Costs about F × self-play search time (CPU), not GPU time. Judge strength per wall-clock hour. |
+| 18 | Playout cap randomization | **off**, p=0.25 full 64 / fast 16 | `selfplay.full_search_probability=0.25 selfplay.full_simulations=64 selfplay.fast_simulations=16` | Same average cost; policy targets from 2x deeper searches. |
+| 19 | Value target | **outcome**, 0.5 outcome + 0.5 search value | `training.value_target_q_weight=0.5` | Lower-variance value target. Watch value loss and margin. |
+| 20 | Shortlist | **score**, mixed | `search.shortlist=mixed` | Quackle's move was in the top-16-by-score shortlist 84.3% of the time and in the mixed shortlist 88.3% (4,000 games). |
+| 21 | Warm start | **none**, Quackle pre-training | `--set init_from=<pretrained.pt>` | The largest expected effect early on. Compare strength after the same number of self-play iterations. |
 
 After rows 3–5, run `configs/large.yaml` once; it changes the network size
-and batch only.
+and batch only. `configs/warm.yaml` combines rows 18–21. Because it changes
+several factors at once, run rows 18–21 one at a time as well before
+attributing its result to any single one of them.
 
 ### Example commands
 

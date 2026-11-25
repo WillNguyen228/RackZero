@@ -261,7 +261,7 @@ class TrainingCheckpointTest(unittest.TestCase):
         ctx = SimpleNamespace(game=game, simulator=SimpleNamespace(stats={}),
                               evaluator=lambda ref: evaluator)
         search = SimpleNamespace(run=lambda *args, **kwargs: SimpleNamespace(
-            moves=(candidate,), policy=np.ones(1)))
+            moves=(candidate,), policy=np.ones(1), value=0.0, selected=None))
         task = SelfPlayTask(1, ModelRef("unused", "t"), {"candidates": CANDIDATES},
                             CANDIDATES, 200)
         with (
@@ -297,7 +297,7 @@ class TrainingCheckpointTest(unittest.TestCase):
             return game
 
         search = SimpleNamespace(run=lambda *args, **kwargs: SimpleNamespace(
-            moves=(candidate,), policy=np.ones(1),
+            moves=(candidate,), policy=np.ones(1), value=0.0, selected=None,
         ))
         with (
             patch("rackzero.evaluation.Game", side_effect=game_factory),

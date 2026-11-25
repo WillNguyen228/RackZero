@@ -828,7 +828,10 @@ engine. It has:
   MLP is kept as a baseline);
 * parallel self-play workers, batched (bf16) GPU training and full
   checkpoint/resume;
-* evaluation with confidence intervals, and information-leakage tests.
+* evaluation with confidence intervals, and information-leakage tests;
+* a warm start from Quackle's static player, plus AlphaZero-family training
+  options: root noise, playout cap randomization, Gumbel root search, q/z value
+  targets and Reanalyse. A Quackle opponent is available for evaluation.
 
 **[Setup, architecture and commands](docs/RACKZERO.md)** |
 **[A100 / NCSA Delta guide](docs/A100_TRAINING.md)** |
