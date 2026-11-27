@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, replace
 import json
+import os
 from pathlib import Path
 import time
 
@@ -23,7 +24,7 @@ from rackzero.search import METHODS, Search, SearchConfig
 from rackzero.stats import mean_interval, wilson_interval
 
 
-OPPONENTS = ("random", "greedy", "heuristic", "neural", "search", "quackle")
+OPPONENTS = ("random", "greedy", "heuristic", "neural", "search", "quackle", "quackle-sim")
 
 
 def evaluation_search_config(search_config: SearchConfig | None, method: str | None = None):
@@ -73,7 +74,7 @@ def play_game(words, simulator, model, baseline, opponent, config, opponent_conf
                 index = (result.selected if result.selected is not None
                          else int(np.argmax(result.policy)))
                 move = result.moves[index].move
-            elif opponent == "quackle":
+            elif opponent in ("quackle", "quackle-sim"):
                 if quackle is None:
                     raise ValueError("The quackle opponent needs a QuackleEngine")
                 move = moves[quackle.choose(info.observation, moves)].move
@@ -192,9 +193,10 @@ def evaluate_model(
     baseline.eval()
     simulator = Simulator(words, max_turns=max_turns, movegen=config.movegen)
     quackle = None
-    if opponent == "quackle":
-        from rackzero.quackle import QuackleEngine
-        quackle = QuackleEngine(words)
+    if opponent in ("quackle", "quackle-sim"):
+        from rackzero.quackle import QuackleEngine, sim_seconds_from_env
+        quackle = QuackleEngine(words, sim_seconds=(
+            sim_seconds_from_env() if opponent == "quackle-sim" else 0))
     started = time.perf_counter()
     pairs = []
     try:
@@ -257,12 +259,19 @@ def main(argv=None):
     parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                         help="override the checkpoint's config, e.g. --set search.simulations=64")
     parser.add_argument("--dictionary", help="override the lexicon path (fingerprint is checked)")
+    parser.add_argument("--quackle-seconds", type=int, default=5,
+                        help="seconds per turn for the quackle-sim opponent (Quackle's "
+                             "championship player; its tournament setting is 20)")
     parser.add_argument("--output", help="append one JSON line per result to this file "
                         "(default for a run directory: <run>/evaluations.jsonl)")
     args = parser.parse_args(argv)
     if args.opponent and args.opponents:
         parser.error("use --opponent or --opponents, not both")
     opponents = args.opponents or [args.opponent or "greedy"]
+    if not 1 <= args.quackle_seconds <= 600:
+        parser.error("--quackle-seconds must be 1..600")
+    from rackzero.quackle import SIM_SECONDS_ENV
+    os.environ[SIM_SECONDS_ENV] = str(args.quackle_seconds)   # read by spawned workers
     if args.opponent_checkpoint and not set(opponents) & {"neural", "search"}:
         parser.error("--opponent-checkpoint requires a neural or search opponent")
 
@@ -286,7 +295,7 @@ def main(argv=None):
     lexicon = lexicon_for(config)
     if checkpoint["dictionary_fingerprint"] != lexicon.fingerprint:
         raise ValueError("Checkpoint dictionary fingerprint does not match")
-    if "quackle" in opponents:
+    if {"quackle", "quackle-sim"} & set(opponents):
         from rackzero.quackle import lexicon_dawg
         lexicon_dawg(lexicon.words)   # build once here, not concurrently in every worker
     which = "model" if args.use_current else "best_model"

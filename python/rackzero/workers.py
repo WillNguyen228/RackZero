@@ -78,13 +78,14 @@ class WorkerContext:
         self._models: dict[str, object] = {}
         self._quackle = None
 
-    def quackle(self, top: int = 10):
+    def quackle(self, top: int = 10, sim_seconds: int = 0):
         """This worker's Quackle process (started on first use)."""
-        if self._quackle is None or self._quackle.top != top:
+        if (self._quackle is None or self._quackle.top != top
+                or self._quackle.sim_seconds != sim_seconds):
             from rackzero.quackle import QuackleEngine
             if self._quackle is not None:
                 self._quackle.close()
-            self._quackle = QuackleEngine(self.words, top=top)
+            self._quackle = QuackleEngine(self.words, top=top, sim_seconds=sim_seconds)
         return self._quackle
 
     def evaluator(self, ref: ModelRef | None):
@@ -144,6 +145,81 @@ class SelfPlayTask:
     full_search_probability: float = 1.0
     fast_simulations: int | None = None
     full_simulations: int | None = None
+    td_lambda: float = 0.7
+    explore_epsilon: float = 0.0
+    q_head: bool = False
+    luck_samples: int = 0
+
+
+def td_lambda_targets(spreads, players, q_taken, final_scores, lam: float,
+                      luck=None) -> list[float]:
+    """TD(lambda) spread-to-go targets (/ 100) for every ply of a finished game.
+
+    For ply i by player p (spread s_i before the move), with j = i + 2 its next
+    own turn: G_i = (s_j - s_i) + 100 * (Q_j - L_j) + lam * (G_j - 100 * Q_j),
+    i.e. (s_j - s_i) + (1 - lam) * 100 * Q_j + lam * G_j when the luck L_j is 0,
+    and G_i = final spread - s_i on the last own turn. Q_j is the acting network's
+    estimate for the move played at j (Monte Carlo when it is unknown); L_j (/ 100)
+    is how much better the rack drawn for turn j is than an average draw.
+    """
+    n = len(spreads)
+    returns = [0.0] * n
+    for i in range(n - 1, -1, -1):
+        p = players[i]
+        j = i + 2
+        if j < n and players[j] == p:
+            lj = 0.0 if luck is None or luck[j] is None else luck[j]
+            later = returns[j] if q_taken[j] is None else (
+                100 * (q_taken[j] - lj) + lam * (returns[j] - 100 * q_taken[j]))
+            returns[i] = spreads[j] - spreads[i] + later
+        else:
+            returns[i] = float(final_scores[p] - final_scores[1 - p]) - spreads[i]
+    return [g / 100 for g in returns]
+
+
+def draw_luck(ctx: WorkerContext, search: Search, game, info, leave, features,
+               samples: int, rng: np.random.Generator):
+    """Greedy move value with the rack drawn minus its mean over resampled draws (/ 100).
+
+    The draws are resampled from the tiles that could have been drawn: everything
+    not on the board, in the opponent's rack or in the mover's leave (the actual
+    draw plus the current bag). None when nothing was drawn or no draw differs.
+    """
+    from rackzero.game import DISTRIBUTION, InformationState, World, board_counts
+    from rackzero.search import shortlist
+
+    obs = info.observation
+    player = int(obs["player"])
+    rack = np.asarray(obs["rack"], dtype=np.int64)
+    drawn = int(rack.sum() - leave.sum())
+    opponent = game._information_for(1 - player).observation["rack"]
+    pool = DISTRIBUTION - board_counts(obs) - opponent - leave
+    if drawn <= 0 or np.any(rack < leave) or np.any(pool < 0) or int(pool.sum()) <= drawn:
+        return None
+    tiles = np.repeat(np.arange(27), pool)
+    config = search.config
+
+    def value(own):
+        view = dict(obs, rack=own)
+        racks = (own, opponent) if player == 0 else (opponent, own)
+        world = World(view, racks, pool - (own - leave), info.history)
+        moves = ctx.simulator.legal_moves(world, rng)
+        if not moves:
+            return None
+        moves = shortlist(tuple(moves), config.candidates, view, config.shortlist)
+        result = search._q_root(moves, InformationState(view, info.history), features)
+        return float(result.q[result.selected])
+
+    actual = value(rack)
+    others = []
+    for _ in range(samples):
+        draw = np.bincount(rng.choice(tiles, drawn, replace=False), minlength=27)
+        v = value(leave + draw)
+        if v is not None:
+            others.append(v)
+    if actual is None or not others:
+        return None
+    return actual - float(np.mean(others))
 
 
 def selfplay_seed(base: int, iteration: int, game: int) -> int:
@@ -173,6 +249,7 @@ def play_selfplay_game(ctx: WorkerContext, task: SelfPlayTask) -> dict:
     # The fourth stream is only used for playout-cap coin flips, so games with
     # full_search_probability == 1 are identical to before it existed.
     game_seq, search_seq, belief_seq, cap_seq = np.random.SeedSequence(task.seed).spawn(4)
+    from rackzero.game import used_tiles
     evaluator = ctx.evaluator(task.model)
     rng = np.random.default_rng(search_seq)
     full_config = SearchConfig(**task.search)
@@ -190,6 +267,9 @@ def play_selfplay_game(ctx: WorkerContext, task: SelfPlayTask) -> dict:
     started = time.perf_counter()
     live_movegen = search_seconds = step_seconds = 0.0
     records, players = [], []
+    spreads, q_taken = [], []   # mover's spread before each ply; Q of the move played
+    luck, leaves = [], {}       # draw luck per ply; each player's leave after their move
+    luck_rng = np.random.default_rng(np.random.SeedSequence(task.seed).spawn(5)[4])
     info = game.reset(seed=int(game_seq.generate_state(1)[0] % 2**31),
                       rng=np.random.default_rng(belief_seq))
     terminated = truncated = False
@@ -220,7 +300,15 @@ def play_selfplay_game(ctx: WorkerContext, task: SelfPlayTask) -> dict:
             records.append(record)
             players.append(int(info.observation["player"]))
             tau = temperature_at(task, ply)
-            if result.selected is not None:
+            # CRN / Q roots: sample from the improved policy while tau > 0 (opening
+            # variety) or with probability explore_epsilon afterwards; otherwise
+            # play the selected (highest-value) move.
+            valued = task.search.get("root_selection") in ("crn", "q")
+            if valued and tau == 0 and task.explore_epsilon > 0 and (
+                    rng.random() < task.explore_epsilon):
+                tau = 1.0
+            crn_explore = valued and tau > 0
+            if result.selected is not None and not crn_explore:
                 # Gumbel root: the sampled action (Gumbel-max over the improved policy).
                 selected = int(result.selected)
             elif tau == 0:
@@ -229,6 +317,22 @@ def play_selfplay_game(ctx: WorkerContext, task: SelfPlayTask) -> dict:
                 weights = np.log(np.maximum(policy, 1e-300))
                 weights = np.exp((weights - weights.max()) / tau)
                 selected = int(rng.choice(len(result.moves), p=weights / weights.sum()))
+            record["action"] = np.int16(selected)
+            if task.q_head:
+                scores_before = info.observation["scores"]
+                spreads.append(float(scores_before[players[-1]] - scores_before[1 - players[-1]]))
+            q_values = getattr(result, "q", None)
+            q_taken.append(None if q_values is None else float(q_values[selected]))
+            mover = players[-1]
+            if task.luck_samples and task.q_head and leaves.get(mover) is not None:
+                luck.append(draw_luck(ctx, search, game, info, leaves[mover],
+                                      record["belief"], task.luck_samples, luck_rng))
+            else:
+                luck.append(None)
+            played = result.moves[selected].move
+            leaves[mover] = (None if not task.luck_samples or played.kind == "exchange" else
+                             np.asarray(info.observation["rack"], dtype=np.int64)
+                             - used_tiles(info.observation, played))
             t3 = time.perf_counter()
             info, terminated, truncated = game.step(result.moves[selected].move)
             step_seconds += time.perf_counter() - t3
@@ -246,6 +350,8 @@ def play_selfplay_game(ctx: WorkerContext, task: SelfPlayTask) -> dict:
         plies=len(records), seconds=time.perf_counter() - started,
         search_seconds=search_seconds, live_movegen_seconds=live_movegen,
         game_step_seconds=step_seconds, belief_resets=resets, full_searches=full_moves,
+        luck_plies=sum(x is not None for x in luck),
+        luck_abs=float(sum(abs(x) for x in luck if x is not None)),
     )
     batch = None
     if natural:
@@ -254,6 +360,11 @@ def play_selfplay_game(ctx: WorkerContext, task: SelfPlayTask) -> dict:
             margin = float(scores[player] - scores[1 - player])
             record["win"] = np.float32(np.sign(margin))
             record["margin"] = np.float32(margin)
+        if task.q_head:
+            for record, target in zip(records, td_lambda_targets(
+                    spreads, players, q_taken, scores, task.td_lambda, luck)):
+                record["q_target"] = np.float32(target)
+                record["q_weight"] = np.float32(1.0)
         batch = stack_records(records)
         stats["positions"] = len(records)
     else:
@@ -281,7 +392,16 @@ def play_evaluation_game(ctx: WorkerContext, task: EvalGameTask):
     return play_game(ctx.words, ctx.simulator, model, baseline, task.opponent,
                      SearchConfig(**task.search), SearchConfig(**task.opponent_search),
                      task.max_turns, task.game_seed, task.seat, game_factory=ctx.game_factory,
-                     quackle=ctx.quackle() if task.opponent == "quackle" else None)
+                     quackle=_quackle_for(ctx, task.opponent))
+
+
+def _quackle_for(ctx: WorkerContext, opponent: str):
+    if opponent == "quackle":
+        return ctx.quackle()
+    if opponent == "quackle-sim":
+        from rackzero.quackle import sim_seconds_from_env
+        return ctx.quackle(sim_seconds=sim_seconds_from_env())
+    return None
 
 
 @dataclass(frozen=True)
@@ -537,6 +657,15 @@ class RemoteEvaluator:
         logits = out["logits"][:len(moves)]
         probs = np.exp(logits - logits.max())
         return probs / probs.sum(), float(out["value"]), float(out["margin"]) * 100
+
+    def predict_q(self, info, moves, belief_mean=None):
+        from rackzero.features import belief_from_mean
+        from rackzero.models.networks import q_outputs
+        out = self._call(encode_record(info, moves, belief_from_mean(info, belief_mean),
+                                       len(moves)), True)
+        if "q" not in out:
+            raise ValueError("This network has no Q head (model.q_head: false)")
+        return q_outputs(out, len(moves))
 
     def predict_value(self, info, belief_mean=None):
         from rackzero.features import belief_from_mean

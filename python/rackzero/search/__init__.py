@@ -11,7 +11,8 @@ from scrabble_gym.environment import ScoredMove
 
 
 METHODS = ("stochastic", "pimc", "ismcts", "belief", "neural_determinization")
-ROOT_SELECTIONS = ("puct", "gumbel")
+ROOT_SELECTIONS = ("puct", "gumbel", "crn", "q")
+CRN_LEAVES = ("value", "margin", "spread", "equity", "q")
 SHORTLISTS = ("score", "mixed")
 
 
@@ -41,6 +42,38 @@ class SearchConfig:
     gumbel_c_visit: float = 50.0      # sigma(q) = (c_visit + max N) * c_scale * q01
     gumbel_c_scale: float = 1.0
     gumbel_scale: float = 1.0         # Gumbel noise scale; 0 = deterministic (evaluation)
+    # root_selection "crn": the top crn_candidates moves by prior are each played
+    # out on the SAME sampled worlds (opponent rack, bag order, draws), i.e.
+    # common random numbers, simulations // crn_candidates samples each. After
+    # the root move both sides play their argmax-policy move for crn_plies - 1
+    # more plies, then the leaf is scored from the root player's view by the
+    # value head ("value"), tanh(predicted final margin / 100) ("margin"),
+    # tanh(spread / 100) ("spread"), or tanh((spread + rack-value difference)
+    # / 100) with the heuristic leave formula ("equity"). Terminal leaves use
+    # the actual result.
+    crn_candidates: int = 6
+    crn_leaf: str = "value"
+    crn_plies: int = 2
+    # root_selection "q" (no search): play argmax of
+    # q_prior_weight * log prior + 100 * Q / q_temperature, Q from the network's Q
+    # head (spread-to-go / 100); the policy target is the softmax of that score.
+    q_prior_weight: float = 1.0
+    q_temperature: float = 2.0       # points of Q per nat
+    # Late-game search (off by default). endgame_playout: with the bag empty the
+    # position is exact (the opponent's rack is the unseen tiles), so every
+    # candidate is played out to the end (at most endgame_plies plies) with both
+    # sides playing the Q agent's move, and the best final spread is played.
+    # endgame_replies > 0: after each candidate the opponent picks, among its
+    # endgame_replies best replies by Q, the one worst for us (2-ply minimax, then
+    # the playout). crn_bag: with root_selection "q", positions with
+    # 1 <= bag <= crn_bag use the CRN search instead of the 1-ply Q choice.
+    # crn_reply: CRN candidates and rollout replies chosen by the argmax "prior"
+    # (original) or by the Q agent's score ("q").
+    endgame_playout: bool = False
+    endgame_replies: int = 0
+    endgame_plies: int = 40
+    crn_bag: int = 0
+    crn_reply: str = "prior"
 
     def __post_init__(self):
         if self.method not in METHODS:
@@ -70,6 +103,29 @@ class SearchConfig:
         if (isinstance(self.gumbel_actions, bool) or not isinstance(self.gumbel_actions, int)
                 or self.gumbel_actions < 2):
             raise ValueError("gumbel_actions must be an integer >= 2")
+        if (isinstance(self.crn_candidates, bool) or not isinstance(self.crn_candidates, int)
+                or self.crn_candidates < 2):
+            raise ValueError("crn_candidates must be an integer >= 2")
+        if self.crn_leaf not in CRN_LEAVES:
+            raise ValueError(f"crn_leaf must be one of {CRN_LEAVES}")
+        if (isinstance(self.crn_plies, bool) or not isinstance(self.crn_plies, int)
+                or self.crn_plies < 1):
+            raise ValueError("crn_plies must be an integer >= 1")
+        for name in ("q_prior_weight", "q_temperature"):
+            value = getattr(self, name)
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                raise ValueError(f"{name} must be finite and nonnegative")
+        if self.q_temperature <= 0:
+            raise ValueError("q_temperature must be positive")
+        for name, low in (("endgame_replies", 0), ("endgame_plies", 1), ("crn_bag", 0)):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < low:
+                raise ValueError(f"{name} must be an integer >= {low}")
+        if not isinstance(self.endgame_playout, bool):
+            raise ValueError("endgame_playout must be true or false")
+        if self.crn_reply not in ("prior", "q"):
+            raise ValueError("crn_reply must be prior or q")
         for name in ("gumbel_c_visit", "gumbel_c_scale", "gumbel_scale"):
             value = getattr(self, name)
             if (isinstance(value, bool) or not isinstance(value, (int, float))
@@ -85,6 +141,7 @@ class SearchResult:
     value: float                  # mean backed-up root value (root player's view, [-1, 1])
     chance_outcomes: int = 0
     selected: int | None = None   # Gumbel root: the action to play (None for PUCT)
+    q: np.ndarray | None = None   # root_selection "q": every candidate's Q (points / 100)
 
 
 def leave_values(observation: dict, moves: tuple[ScoredMove, ...]) -> np.ndarray:
@@ -95,6 +152,15 @@ def leave_values(observation: dict, moves: tuple[ScoredMove, ...]) -> np.ndarray
     consonants = leaves[:, :26].sum(1) - vowels
     return (5 * leaves[:, 26] + 2 * leaves[:, 18] - 0.5 * (leaves @ POINTS)
             - np.abs(vowels - consonants) - np.maximum(leaves[:, :26] - 1, 0).sum(1))
+
+
+def rack_value(rack: np.ndarray) -> float:
+    """The heuristic leave formula (see ``leave_values``) applied to a whole rack."""
+    rack = np.asarray(rack, dtype=np.int64)
+    vowels = int(rack[[0, 4, 8, 14, 20]].sum())
+    consonants = int(rack[:26].sum()) - vowels
+    return float(5 * rack[26] + 2 * rack[18] - 0.5 * (rack @ POINTS)
+                 - abs(vowels - consonants) - np.maximum(rack[:26] - 1, 0).sum())
 
 
 def shortlist(moves: tuple[ScoredMove, ...], limit: int, observation: dict | None = None,
@@ -361,6 +427,147 @@ class Search:
         improved = np.exp(z - z.max())
         return improved / improved.sum(), selected
 
+    def _crn_leaf(self, world: World, root: int) -> float:
+        if world.terminal:
+            return self._terminal(world, root)
+        leaf = self.config.crn_leaf
+        if leaf in ("spread", "equity"):
+            scores = world.observation["scores"]
+            spread = float(scores[root] - scores[1 - root])
+            if leaf == "equity":
+                spread += rack_value(world.racks[root]) - rack_value(world.racks[1 - root])
+            return math.tanh(spread / 100)
+        info = world.information()
+        if leaf == "q":
+            # Spread now plus the Q head's spread-to-go for the move the Q agent
+            # would play here (leaf player's view).
+            obs = info.observation
+            player = int(obs["player"])
+            moves = self._shortlist(self.simulator.legal_moves(world, self.rng), info)
+            score, q = self._q_pick(info, moves)
+            spread = float(obs["scores"][player] - obs["scores"][1 - player])
+            value = math.tanh((spread + 100 * float(q[int(np.argmax(score))])) / 100)
+            return value if player == root else -value
+        if leaf == "margin" and hasattr(self.model, "predict_value"):
+            value = math.tanh(self.model.predict_value(info)[1] / 100)
+        else:
+            value = self._leaf_value(world, info)
+        return value if info.observation["player"] == root else -value
+
+    def _q_pick(self, info, moves, mean=None):
+        """The Q agent's score per candidate (q_prior_weight * log prior + 100 Q /
+        q_temperature) and Q (points / 100)."""
+        prior, q = self.model.predict_q(info, moves, mean)
+        q = np.asarray(q, dtype=np.float64)
+        c = self.config
+        score = (c.q_prior_weight * np.log(np.maximum(np.asarray(prior, dtype=np.float64), 1e-12))
+                 + 100 * q / c.q_temperature)
+        return score, q
+
+    def _reply(self, info, replies) -> int:
+        if self.config.crn_reply == "q":
+            return int(np.argmax(self._q_pick(info, replies)[0]))
+        priors, _ = self._prediction(info, replies)
+        return int(np.argmax(priors))
+
+    def _playout(self, world: World, root: int, rng) -> float:
+        """Both sides play the Q agent's move to the end; final spread for root."""
+        for _ in range(self.config.endgame_plies):
+            if world.terminal:
+                break
+            info = world.information()
+            replies = self._shortlist(self.simulator.legal_moves(world, rng), info)
+            world = self.simulator.step(world, replies[int(np.argmax(
+                self._q_pick(info, replies)[0]))].move, rng)
+        scores = world.observation["scores"]
+        return float(scores[root] - scores[1 - root])
+
+    def _endgame(self, info, moves, belief, root) -> SearchResult:
+        """Bag empty: exact world; every candidate is played out (optionally after
+        the opponent's worst-for-us reply among its endgame_replies best by Q)."""
+        c = self.config
+        world = self.simulator.determinize(info, belief.sample())
+        obs = info.observation
+        spread = float(obs["scores"][root] - obs["scores"][1 - root])
+        finals = np.empty(len(moves))
+        rng = np.random.default_rng(0)   # nothing is drawn with the bag empty
+        for i, move in enumerate(moves):
+            after = self.simulator.step(world, move.move, rng)
+            if c.endgame_replies and not after.terminal:
+                reply_info = after.information()
+                replies = self._shortlist(self.simulator.legal_moves(after, rng), reply_info)
+                score, _ = self._q_pick(reply_info, replies)
+                top = np.argsort(-score, kind="stable")[:c.endgame_replies]
+                finals[i] = min(self._playout(self.simulator.step(after, replies[j].move, rng),
+                                              root, rng) for j in top)
+            else:
+                finals[i] = self._playout(after, root, rng)
+        q = (finals - spread) / 100
+        selected = int(np.argmax(finals))
+        z = 100 * q / c.q_temperature
+        policy = np.exp(z - z.max())
+        return SearchResult(moves, policy / policy.sum(), np.ones(len(moves), dtype=np.int64),
+                            float(np.clip(q[selected], -1, 1)), 0, selected, q)
+
+    def _crn_rollout(self, world: World, root: int, move, seed: int) -> float:
+        """Root move, then crn_plies - 1 argmax-policy plies, then the leaf.
+        The same ``seed`` for every candidate gives every candidate the same bag
+        order (Java shuffles with a seed drawn from this generator)."""
+        rng = np.random.default_rng(seed)
+        world = self.simulator.step(world, move.move, rng)
+        for _ in range(self.config.crn_plies - 1):
+            if world.terminal:
+                break
+            info = world.information()
+            replies = self._shortlist(self.simulator.legal_moves(world, rng), info)
+            world = self.simulator.step(world, replies[self._reply(info, replies)].move, rng)
+        return self._crn_leaf(world, root)
+
+    def _crn(self, info, moves, mean, belief, root) -> SearchResult:
+        """Paired comparison of the prior's top candidates on common sampled worlds."""
+        c = self.config
+        prior, prior_value = self._prediction(info, moves, mean)
+        prior = np.asarray(prior, dtype=np.float64)
+        if c.crn_reply == "q":   # rank (and prior) by the Q agent's score
+            score = self._q_pick(info, moves, mean)[0]
+            prior = np.exp(score - score.max())
+        prior = prior / prior.sum()
+        k = min(c.crn_candidates, len(moves))
+        candidates = np.argsort(-prior, kind="stable")[:k]
+        samples = max(1, c.simulations // k)
+        visits = np.zeros(len(moves), dtype=np.int64)
+        totals = np.zeros(len(moves))
+        for _ in range(samples):
+            world = self.simulator.determinize(info, belief.sample())
+            seed = int(self.rng.integers(0, 2**63 - 1))
+            for action in candidates:
+                totals[action] += self._crn_rollout(world, root, moves[action], seed)
+                visits[action] += 1
+        visited = visits > 0
+        q = np.where(visited, totals / np.maximum(1, visits), 0.0)
+        selected = int(candidates[int(np.argmax(q[candidates]))])
+        # Improved policy as in Gumbel AlphaZero: completed Q-values (unsearched
+        # candidates get the prior-weighted mix value) added to the prior logits.
+        mass = float(prior[visited].sum())
+        v_mix = (prior_value + samples * float((prior[visited] * q[visited]).sum()) / mass) / (
+            1 + samples)
+        completed = np.where(visited, q, v_mix)
+        z = np.log(np.maximum(prior, 1e-12)) + self._sigma(completed, visits)
+        policy = np.exp(z - z.max())
+        return SearchResult(moves, policy / policy.sum(), visits, float(q[selected]), 0, selected)
+
+    def _q_root(self, moves, info, mean) -> SearchResult:
+        """No search: rank candidates by the policy prior plus the Q head."""
+        c = self.config
+        prior, q = self.model.predict_q(info, moves, mean)
+        q = np.asarray(q, dtype=np.float64)
+        score = (c.q_prior_weight * np.log(np.maximum(np.asarray(prior, dtype=np.float64), 1e-12))
+                 + 100 * q / c.q_temperature)
+        policy = np.exp(score - score.max())
+        selected = int(np.argmax(score))
+        return SearchResult(moves, policy / policy.sum(), np.zeros(len(moves), dtype=np.int64),
+                            float(np.clip(q[selected], -1, 1)), 0, selected, q)
+
     def run(self, info: InformationState, moves=None, belief: RackBelief | None = None,
             root_features: np.ndarray | None = None):
         """Search from ``info``. ``root_features`` overrides the root belief features
@@ -381,6 +588,15 @@ class Search:
         moves = shortlist(tuple(moves), config.candidates, info.observation, config.shortlist)
         if mean is None:
             mean = self._belief_input(info, belief)
+        bag = int(info.observation["bag_size"])
+        if config.endgame_playout and bag == 0 and len(moves) > 1 and self.model is not None:
+            return self._endgame(info, moves, belief, root)
+        if config.root_selection == "q":
+            if 0 < bag <= config.crn_bag and len(moves) > 1:
+                return self._crn(info, moves, mean, belief, root)
+            return self._q_root(moves, info, mean)
+        if config.root_selection == "crn" and len(moves) > 1:
+            return self._crn(info, moves, mean, belief, root)
         gumbel = config.root_selection == "gumbel"
         if not gumbel and config.root_noise_fraction > 0 and len(moves) > 1:
             self._root_noise = self.rng.dirichlet(np.full(len(moves), config.root_noise_alpha))

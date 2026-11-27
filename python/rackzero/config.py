@@ -86,6 +86,17 @@ class SelfPlayConfig:
     # Self-play full-search budget; None = search.simulations. Evaluation and the
     # arena always use search.simulations, so results stay comparable.
     full_simulations: int | None = None
+    # TD(lambda) for the Q-head targets (model.q_head): 0 = bootstrap fully on the
+    # next own-turn Q estimate, 1 = Monte Carlo spread-to-go.
+    td_lambda: float = 0.7
+    # After the temperature plies, play a move sampled from the search policy with
+    # this probability instead of the selected move (exploration for Q learning).
+    explore_epsilon: float = 0.0
+    # Luck-adjusted Q targets (variance reduction, as in backgammon engines): at
+    # each own turn, compare the greedy move value with the rack actually drawn to
+    # its average over this many resampled draws from the same pool, and remove the
+    # difference from the TD(lambda) target. 0 = off.
+    luck_samples: int = 0
 
     def __post_init__(self):
         _positive_int("selfplay", "games_per_iteration", self.games_per_iteration)
@@ -102,6 +113,9 @@ class SelfPlayConfig:
         if self.temperature_moves is not None:
             _positive_int("selfplay", "temperature_moves", self.temperature_moves, 0)
         _finite("selfplay", "full_search_probability", self.full_search_probability, 0, 1)
+        _finite("selfplay", "td_lambda", self.td_lambda, 0, 1)
+        _finite("selfplay", "explore_epsilon", self.explore_epsilon, 0, 1)
+        _positive_int("selfplay", "luck_samples", self.luck_samples, 0)
         if self.full_search_probability <= 0:
             raise ValueError("selfplay.full_search_probability must be positive")
         if self.full_search_probability < 1 and self.fast_simulations is None:
@@ -147,6 +161,7 @@ class TrainingConfig:
     # Value target = (1 - w) * game outcome z + w * search root value q (as in
     # Leela Chess Zero / KataGo). 0 = outcome only (original).
     value_target_q_weight: float = 0.0
+    q_loss_weight: float = 1.0        # Q-head TD loss (model.q_head only)
 
     def __post_init__(self):
         for name in ("steps_per_iteration", "batch_size", "min_replay", "lr_step_size"):
@@ -164,7 +179,7 @@ class TrainingConfig:
         if self.learning_rate <= 0:
             raise ValueError("training.learning_rate must be positive")
         for name in ("weight_decay", "momentum", "grad_clip", "policy_loss_weight",
-                     "value_loss_weight", "margin_loss_weight"):
+                     "value_loss_weight", "margin_loss_weight", "q_loss_weight"):
             _finite("training", name, getattr(self, name), 0)
         _finite("training", "lr_min_factor", self.lr_min_factor, 0, 1)
         _finite("training", "lr_gamma", self.lr_gamma, 0, 1)

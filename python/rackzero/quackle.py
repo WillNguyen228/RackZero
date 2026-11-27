@@ -6,6 +6,12 @@ value). It sees exactly what the acting player sees: the board, its own rack
 and the bag size. Its moves are matched to the Java engine's legal moves, so the
 Java rules engine stays the authority on legality and scoring.
 
+With ``sim_seconds`` > 0 it plays Quackle's championship player instead (Smart
+Bogowin: 2-ply simulation over sampled opponent racks and draws, chosen by win
+probability; exact endgame player when the bag is empty), given the true unseen
+tiles and both scores, with that many seconds per turn. The bridge seeds its own
+random numbers, so simulation games are not reproducible move for move.
+
 Requires a local Quackle build (``python -m scrabble_gym.quackle_build``).
 """
 
@@ -13,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
@@ -61,8 +68,17 @@ def lexicon_dawg(words: frozenset[str]) -> Path:
     return dawg
 
 
-def position_text(observation: dict) -> str:
-    """One bridge request line from the acting player's observation."""
+SIM_SECONDS_ENV = "RACKZERO_QUACKLE_SECONDS"
+
+
+def sim_seconds_from_env(default: int = 5) -> int:
+    """Seconds per turn for the ``quackle-sim`` opponent (evaluate.py --quackle-seconds)."""
+    return int(os.environ.get(SIM_SECONDS_ENV, default))
+
+
+def position_text(observation: dict, sim: bool = False) -> str:
+    """One bridge request line from the acting player's observation (with the
+    unseen tiles and both scores for the simulating player)."""
     board, blanks = observation["board"], observation["board_blanks"]
     cells = []
     for r in range(15):
@@ -74,7 +90,17 @@ def position_text(observation: dict) -> str:
                 letter = ALPHABET[code - 1]
                 cells.append(letter.lower() if blanks[r, c] else letter)
     rack = "".join(letter * int(n) for letter, n in zip(ALPHABET, observation["rack"]))
-    return f"{''.join(cells)} {rack} {int(observation['bag_size'])}"
+    text = f"{''.join(cells)} {rack} {int(observation['bag_size'])}"
+    if sim:
+        from rackzero.game import DISTRIBUTION, board_counts
+        unseen = DISTRIBUTION - board_counts(observation) - np.asarray(observation["rack"])
+        if np.any(unseen < 0):
+            raise ValueError("Observation violates tile conservation")
+        letters = "".join(letter * int(n) for letter, n in zip(ALPHABET, unseen))
+        player = int(observation["player"])
+        scores = observation["scores"]
+        text += f" {letters or '-'} {int(scores[player])} {int(scores[1 - player])}"
+    return text
 
 
 def move_key(board: np.ndarray, move: Move) -> tuple:
@@ -124,9 +150,10 @@ def _parse(lines: list[str], rack: str) -> list[tuple[tuple, float, int]]:
 
 
 class QuackleEngine:
-    """A persistent Quackle static-player process for one lexicon."""
+    """A persistent Quackle static-player (or, with ``sim_seconds``, championship
+    player) process for one lexicon."""
 
-    def __init__(self, words: frozenset[str], top: int = 10):
+    def __init__(self, words: frozenset[str], top: int = 10, sim_seconds: int = 0):
         if not quackle_available():
             raise FileNotFoundError("Quackle is not built; run python -m scrabble_gym.quackle_build")
         manifest = json.loads((_target() / "manifest.json").read_text(encoding="utf-8"))
@@ -134,6 +161,7 @@ class QuackleEngine:
         self.executable = (root / manifest["executable"]).resolve()
         self.dawg = lexicon_dawg(words)
         self.top = int(top)
+        self.sim_seconds = int(sim_seconds)
         self.revision = manifest.get("revision")
         self._lock = threading.Lock()
         self._process = None
@@ -145,14 +173,15 @@ class QuackleEngine:
             root = _root()
             self._process = subprocess.Popen(
                 [str(self.executable), str(self.dawg.relative_to(root)), "--serve",
-                 "--top", str(self.top)],
+                 "--top", str(self.top)]
+                + (["--sim", str(self.sim_seconds)] if self.sim_seconds > 0 else []),
                 cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, encoding="utf-8", bufsize=1)
         return self._process
 
     def ranked(self, observation: dict) -> list[tuple[tuple, float, int]]:
         """Quackle's best moves for the acting player: [(move key, equity, score)]."""
-        request = position_text(observation)
+        request = position_text(observation, self.sim_seconds > 0)
         rack = request.split()[1]
         with self._lock:
             process = self._start()

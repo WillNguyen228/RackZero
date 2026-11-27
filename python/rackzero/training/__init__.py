@@ -152,13 +152,23 @@ def compute_losses(out: dict, batch: dict, training, value_head: str) -> dict:
     margin_loss = (out["margin"].float() - batch["margin"] / training.margin_scale).square().mean()
     total = (training.policy_loss_weight * policy_loss + training.value_loss_weight * value_loss
              + training.margin_loss_weight * margin_loss)
+    q_loss = torch.zeros((), device=total.device)
+    if "q" in out and "q_weight" in batch:
+        q_taken = out["q"].float().gather(1, batch["action"].long().unsqueeze(1)).squeeze(1)
+        if "after_taken" in out:
+            q_taken = q_taken + out["after_taken"].float()
+        q_weight = batch["q_weight"]
+        q_loss = ((q_weight * (q_taken - batch["q_target"]).square()).sum()
+                  / q_weight.sum().clamp_min(1.0))
+        total = total + getattr(training, "q_loss_weight", 1.0) * q_loss
     with torch.no_grad():
         probs = log_probs.exp().masked_fill(~mask, 0.0)
         entropy = ((weight * -(probs * log_probs).sum(-1)).sum() / weight_sum)
         top1 = (weight * (logits.argmax(-1) == target.argmax(-1)).float()).sum() / weight_sum
         value_mse = (out["value"].float() - win).square().mean()
     return {"total": total, "policy": policy_loss, "value": value_loss, "margin": margin_loss,
-            "policy_entropy": entropy, "policy_top1": top1, "value_mse": value_mse}
+            "policy_entropy": entropy, "policy_top1": top1, "value_mse": value_mse,
+            "q": q_loss}
 
 
 def new_run_dir(config: Config) -> Path:
@@ -319,10 +329,24 @@ class Trainer:
         source = load_checkpoint(path)
         if source["dictionary_fingerprint"] != self.lexicon.fingerprint:
             raise ValueError("init_from checkpoint dictionary fingerprint does not match")
-        if asdict(self.config.model) != asdict(ModelConfig.from_dict(source["model_config"])):
+        ours = asdict(self.config.model)
+        theirs = asdict(ModelConfig.from_dict(source["model_config"]))
+        # Q / afterstate heads may be added to a warm start that lacks them (they
+        # start at zero); new keys must then belong to those heads only.
+        new_prefixes = []
+        for flag, prefix in (("q_head", "q."), ("after_head", "after.")):
+            if ours[flag] and not theirs[flag]:
+                theirs[flag] = True
+                new_prefixes.append(prefix)
+        theirs["after_top"] = ours["after_top"]  # inference-time setting only
+        new_q = bool(new_prefixes)
+        if ours != theirs:
             raise ValueError("init_from checkpoint has a different model architecture; "
                              "use the same model settings as the warm start")
-        self.model.load_state_dict(source["best_model"])
+        missing, unexpected = self.model.load_state_dict(source["best_model"], strict=not new_q)
+        if new_q and (unexpected or any(not k.startswith(tuple(new_prefixes)) for k in missing)):
+            raise ValueError(f"init_from weights do not match: missing {missing}, "
+                             f"unexpected {unexpected}")
         self.best_model = self._cpu_state()
 
     # -- workers ----------------------------------------------------------- #
@@ -377,7 +401,8 @@ class Trainer:
             cfg.search.candidates, cfg.max_turns, cfg.selfplay.temperature,
             cfg.selfplay.temperature_moves, cfg.selfplay.final_temperature,
             cfg.selfplay.full_search_probability, cfg.selfplay.fast_simulations,
-            cfg.selfplay.full_simulations,
+            cfg.selfplay.full_simulations, cfg.selfplay.td_lambda,
+            cfg.selfplay.explore_epsilon, bool(cfg.model.q_head), cfg.selfplay.luck_samples,
         ) for i in range(cfg.selfplay.games_per_iteration)]
         started = time.perf_counter()
         results = executor.map("selfplay", tasks, self._progress("self-play"))
@@ -413,6 +438,10 @@ class Trainer:
             "belief_resets": totals["belief_resets"],
             "full_search_fraction": totals.get("full_searches", totals["plies"]) / plies,
             "workers": cfg.selfplay.workers,
+            "luck_plies": totals.get("luck_plies", 0),
+            # Mean |draw luck| in points over the plies with a luck adjustment.
+            "luck_mean_abs": (100 * totals.get("luck_abs", 0.0) / totals["luck_plies"]
+                              if totals.get("luck_plies") else 0.0),
         }
         if self.server is not None:
             stats.update(self.server.stats())
@@ -467,7 +496,7 @@ class Trainer:
             torch.cuda.reset_peak_memory_stats()
         self.model.train()
         names = ("total", "policy", "value", "margin", "policy_entropy", "policy_top1",
-                 "value_mse")
+                 "value_mse", "q")
         # Accumulate on the device; one host synchronization per iteration.
         sums = {name: torch.zeros((), device=self.device) for name in names}
         grad_norm_sum = torch.zeros((), device=self.device)
@@ -503,7 +532,7 @@ class Trainer:
         self.counters["optimizer_steps"] += steps
         self.counters["training_samples"] += steps * cfg.batch_size
         self.model.eval()
-        stats = {f"{name}_loss" if name in ("total", "policy", "value", "margin") else name:
+        stats = {f"{name}_loss" if name in ("total", "policy", "value", "margin", "q") else name:
                  value / steps for name, value in sums.items()}
         stats.update(
             loss=sums["total"] / steps, steps=steps, batch_size=cfg.batch_size,
@@ -620,7 +649,8 @@ def summary_line(record: dict) -> str:
         parts.append(f"reanalyse {ra['positions']}pos {ra['wall_seconds']:.0f}s")
     if not tr.get("skipped"):
         parts.append(f"loss {tr['loss']:.3f} (p {tr['policy_loss']:.3f} v {tr['value_loss']:.3f} "
-                     f"m {tr['margin_loss']:.3f}) {tr['samples_per_second']:.0f} samples/s")
+                     f"m {tr['margin_loss']:.3f} q {tr.get('q_loss', 0.0):.4f}) "
+                     f"{tr['samples_per_second']:.0f} samples/s")
     if record.get("arena"):
         parts.append(f"arena {record['arena']['win_rate']:.2f}"
                      f"{' promoted' if record['promoted'] else ' rejected'}")

@@ -46,7 +46,7 @@ RECORD_FIELDS = {
     "cand_mask": (("K",), np.bool_),
 }
 INDEX_FIELDS = frozenset(("board", "cand_cells", "cand_letters", "cand_start", "cand_dir",
-                          "cand_len", "cand_kind"))
+                          "cand_len", "cand_kind", "action"))
 TARGET_FIELDS = {
     "policy": (("K",), np.float32),
     "win": ((), np.float32),
@@ -57,6 +57,11 @@ TARGET_FIELDS = {
     # 1 if ``policy`` is a training target (full search / teacher), 0 otherwise
     # (playout cap randomization's fast searches).
     "policy_weight": ((), np.float32),
+    # TD(lambda) move-value target for the candidate actually played: spread-to-go
+    # / 100 (q_weight 1), or no Q target (q_weight 0, e.g. teacher/older records).
+    "action": ((), np.int16),
+    "q_target": ((), np.float32),
+    "q_weight": ((), np.float32),
 }
 
 
@@ -68,6 +73,12 @@ def fill_target_defaults(batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         batch["search_value"] = np.asarray(batch["win"], dtype=np.float32).copy()
     if "policy_weight" not in batch and "policy" in batch:
         batch["policy_weight"] = np.ones(len(batch["policy"]), dtype=np.float32)
+    if "policy" in batch:
+        n = len(batch["policy"])
+        for name, dtype in (("action", np.int16), ("q_target", np.float32),
+                            ("q_weight", np.float32)):
+            if name not in batch:
+                batch[name] = np.zeros(n, dtype=dtype)
     return batch
 
 

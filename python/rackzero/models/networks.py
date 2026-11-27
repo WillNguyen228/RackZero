@@ -61,6 +61,14 @@ class ModelConfig:
     norm: str = "batch"
     value_head: str = "scalar"
     margin_head: bool = True
+    # Per-candidate move value Q(s, a): predicted spread-to-go (final margin minus
+    # the current margin, / 100) after playing the candidate; trained by TD(lambda).
+    q_head: bool = False
+    # Afterstate head (TD-Gammon style): value of the position *after* a candidate is
+    # played (mover's view, spread-to-go / 100), added to Q for the ``after_top``
+    # candidates ranked highest by log prior + Q. Needs ``q_head``.
+    after_head: bool = False
+    after_top: int = 12
     legacy_hidden: int = 128
 
     def __post_init__(self):
@@ -68,7 +76,7 @@ class ModelConfig:
             raise ValueError(f"model.arch must be one of {ARCHITECTURES}")
         for name in ("channels", "blocks", "latent", "rack_dim", "belief_dim", "global_dim",
                      "move_dim", "policy_hidden", "value_hidden", "attention_heads",
-                     "legacy_hidden"):
+                     "legacy_hidden", "after_top"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"model.{name} must be a positive integer")
@@ -86,6 +94,8 @@ class ModelConfig:
             raise ValueError("model.value_head must be scalar or wdl")
         if not isinstance(self.margin_head, bool):
             raise ValueError("model.margin_head must be a boolean")
+        if self.after_head and not self.q_head:
+            raise ValueError("model.after_head requires model.q_head")
 
     @classmethod
     def from_dict(cls, values: dict) -> "ModelConfig":
@@ -142,6 +152,50 @@ def candidate_tensors(batch: dict) -> dict:
                        (letters > 0).float())
     return {"placed": placed, "word": word, "spent": spent[..., :27],
             "valid_cells": valid_cells, "tile": tile}
+
+
+def afterstate_batch(batch: dict, index: torch.Tensor) -> dict:
+    """State inputs of the positions after playing candidates ``index`` [B, M].
+
+    The mover keeps the perspective: placed tiles go on the board, the rack becomes
+    the leave (draws are unknown), exchanged tiles return to the unseen pool and the
+    move score is added to the mover's score. Returns B * M flattened records.
+    """
+    B, M = index.shape
+
+    def take(name):
+        x = batch[name]
+        idx = index.view(B, M, *([1] * (x.dim() - 2))).expand(B, M, *x.shape[2:])
+        return x.gather(1, idx).reshape(B * M, *x.shape[2:])
+
+    def repeat(name):
+        return batch[name].repeat_interleave(M, 0)
+
+    cells, letters, cand_blanks = take("cand_cells"), take("cand_letters"), take("cand_blanks")
+    kind, score = take("cand_kind"), take("cand_score")
+    valid = cells >= 0
+    pos = torch.where(valid, cells, torch.full_like(cells, 225)).long()
+
+    def place(plane, values):
+        padded = torch.cat((plane, plane.new_zeros(plane.shape[0], 1)), dim=1)
+        values = torch.where(valid, values.to(plane.dtype), torch.zeros_like(values, dtype=plane.dtype))
+        return padded.scatter(1, pos, values)[:, :225]
+
+    board = place(repeat("board"), letters)
+    blanks = place(repeat("blanks"), (cand_blanks > 0))
+    tile = torch.where(cand_blanks > 0, torch.full_like(letters, 26), letters - 1).long()
+    spent = torch.zeros(B * M, 28, device=letters.device)
+    spent.scatter_add_(1, torch.where(letters > 0, tile, torch.full_like(tile, 27)),
+                       (letters > 0).float())
+    spent = spent[:, :27]
+    rack = repeat("rack")
+    unseen = repeat("unseen")
+    scalars = repeat("scalars").clone()
+    scalars[:, 0] = scalars[:, 0] + score.to(scalars.dtype)
+    return {"board": board, "blanks": blanks,
+            "rack": (rack - spent.to(rack.dtype)).clamp(min=0),
+            "unseen": unseen + (spent * (kind == 1).unsqueeze(-1)).to(unseen.dtype),
+            "belief": repeat("belief"), "scalars": scalars}
 
 
 def normalized_scalars(scalars: torch.Tensor) -> torch.Tensor:
@@ -222,6 +276,18 @@ class RackZeroNet(nn.Module):
         self.value_trunk = _mlp([c.latent, c.value_hidden], c.dropout)
         self.value = nn.Linear(c.value_hidden, 3 if c.value_head == "wdl" else 1)
         self.margin = nn.Linear(c.value_hidden, 1) if c.margin_head else None
+        self.q = None
+        if c.q_head:
+            self.q = _mlp([3 * c.move_dim, c.policy_hidden, 1], c.dropout, final_activation=False)
+            # Zero output at initialization: a warm-started network first plays its policy.
+            nn.init.zeros_(self.q[-1].weight)
+            nn.init.zeros_(self.q[-1].bias)
+        self.after = None
+        if c.after_head:
+            self.after = nn.Linear(c.value_hidden, 1)
+            # Zero at initialization: the network first plays exactly as its Q head.
+            nn.init.zeros_(self.after.weight)
+            nn.init.zeros_(self.after.bias)
 
     def encode(self, batch: dict):
         board = batch["board"]
@@ -274,6 +340,8 @@ class RackZeroNet(nn.Module):
             out["value"] = value.squeeze(-1).tanh()
         out["margin"] = (self.margin(hidden).squeeze(-1) if self.margin is not None
                          else torch.zeros_like(out["value"]))
+        if self.after is not None:
+            out["after"] = self.after(hidden).squeeze(-1).float()
         if not policy:
             return out
         derived = candidate_tensors(batch)
@@ -288,9 +356,32 @@ class RackZeroNet(nn.Module):
         if self.attention is not None:
             moves = self.attention(moves, src_key_padding_mask=~mask)
         context = self.latent_to_move(latent).unsqueeze(1).expand_as(moves)
-        logits = self.policy(torch.cat((self.spatial(pooled), moves, context), dim=-1))
+        joint = torch.cat((self.spatial(pooled), moves, context), dim=-1)
+        logits = self.policy(joint)
         out["logits"] = logits.squeeze(-1).float().masked_fill(~mask, float("-inf"))
+        if self.q is not None:
+            out["q"] = self.q(joint).squeeze(-1).float().masked_fill(~mask, 0.0)
+        if self.after is not None:
+            if self.training:
+                # Training: afterstate value of the move actually played.
+                if "action" in batch:
+                    action = batch["action"].long().unsqueeze(1)
+                    out["after_taken"] = self.afterstate_values(batch, action)[:, 0]
+            else:
+                q = out["q"]
+                k = min(self.config.after_top, q.shape[1])
+                rank = (torch.log_softmax(out["logits"], -1) + 50 * q).masked_fill(
+                    ~mask, float("-inf"))
+                top = rank.topk(k, dim=-1).indices
+                total = q.gather(1, top) + self.afterstate_values(batch, top)
+                total = total.masked_fill(~mask.gather(1, top), float("-inf"))
+                out["q_after"] = torch.full_like(q, float("-inf")).scatter(1, top, total)
         return out
+
+    def afterstate_values(self, batch: dict, index: torch.Tensor) -> torch.Tensor:
+        """Afterstate head (spread-to-go / 100, mover's view) for candidates [B, M]."""
+        after = afterstate_batch(batch, index)
+        return self.forward(after, policy=False)["after"].view(index.shape)
 
 
 class LegacyNet(nn.Module):
@@ -357,6 +448,16 @@ def parameter_count(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
+def q_outputs(out: dict, n: int):
+    """(policy probabilities, move values / 100) from one record's network outputs.
+
+    With an afterstate head the values are Q + afterstate value for the top
+    candidates and -inf for the rest (never chosen)."""
+    logits = out["logits"][:n]
+    probs = np.exp(logits - logits.max())
+    return probs / probs.sum(), np.asarray(out.get("q_after", out["q"]))[:n]
+
+
 class NetworkEvaluator:
     """Search-facing adapter: ``predict``/``predict_value`` on one information state.
 
@@ -401,6 +502,14 @@ class NetworkEvaluator:
         logits = out["logits"][0]
         probs = np.exp(logits - logits.max())
         return probs / probs.sum(), float(out["value"][0]), float(out["margin"][0]) * 100
+
+    def predict_q(self, info, moves, belief_mean=None):
+        """(policy probabilities, Q values in points / 100) for every candidate."""
+        record = encode_record(info, moves, belief_from_mean(info, belief_mean), len(moves))
+        out = self._run([record], policy=True)
+        if "q" not in out:
+            raise ValueError("This network has no Q head (model.q_head: false)")
+        return q_outputs({k: v[0] for k, v in out.items()}, len(moves))
 
     def predict_value(self, info, belief_mean=None):
         from scrabble_gym.environment import Move, ScoredMove

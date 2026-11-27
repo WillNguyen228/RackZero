@@ -13,6 +13,13 @@
 // line "EQUITY e" followed by its block.
 // --serve: answer positions until end of input; every answer (or "ERROR msg")
 // ends with a line "END" and is flushed, so one process serves many requests.
+// --sim SECONDS: play Quackle's championship player (Smart Bogowin: 2-ply
+// simulation over sampled opponent racks and draws, chosen by win probability;
+// exact endgame player when the bag is empty) with SECONDS per turn instead of
+// the static player. Each request then also carries the unseen tiles (bag plus
+// opponent rack; '?' blank; "-" if none) and both scores:
+//   <cells> <rack> <bag size> <unseen> <own score> <opponent score>
+// and the answer is "MOVES 1", "EQUITY e" and the chosen move's block.
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -24,6 +31,7 @@
 
 #include "alphabetparameters.h"
 #include "board.h"
+#include "bogowinplayer.h"
 #include "boardparameters.h"
 #include "datamanager.h"
 #include "evaluator.h"
@@ -114,13 +122,24 @@ void writeMove(std::ostream& out, Quackle::DataManager& data, const Quackle::Mov
 }
 
 // Returns false at end of input.
-bool solve(std::istream& in, std::ostream& out, Quackle::DataManager& data, int top) {
-    std::string cells, rackText;
-    int bagSize;
+bool solve(std::istream& in, std::ostream& out, Quackle::DataManager& data, int top,
+           int simSeconds) {
+    std::string cells, rackText, unseenText;
+    int bagSize, ownScore = 0, oppScore = 0;
     if (!(in >> cells)) return false;
     if (!(in >> rackText >> bagSize) || cells.size() != 225
         || rackText.empty() || rackText.size() > 7 || bagSize < 0 || bagSize > 100)
         throw std::runtime_error("Invalid position");
+    if (simSeconds > 0) {
+        if (!(in >> unseenText >> ownScore >> oppScore))
+            throw std::runtime_error("Sim requests need unseen tiles and both scores");
+        if (unseenText == "-") unseenText.clear();
+        for (char c : unseenText)
+            if (c != '?' && !(c >= 'A' && c <= 'Z'))
+                throw std::runtime_error("Invalid unseen letter");
+        int oppSize = static_cast<int>(unseenText.size()) - bagSize;
+        if (oppSize < 0 || oppSize > 7) throw std::runtime_error("Unseen tiles do not match bag size");
+    }
     for (char c : cells)
         if (c != '.' && !(c >= 'A' && c <= 'Z') && !(c >= 'a' && c <= 'z'))
             throw std::runtime_error("Invalid board letter");
@@ -139,12 +158,56 @@ bool solve(std::istream& in, std::ostream& out, Quackle::DataManager& data, int 
     Quackle::PlayerList players;
     players.push_back(Quackle::Player("Agent", Quackle::Player::ComputerPlayerType, 1));
     players.push_back(Quackle::Player("Unknown", Quackle::Player::HumanPlayerType, 2));
+    players[0].setScore(ownScore);
+    players[1].setScore(oppScore);
     Quackle::GamePosition position(players);
     // Quackle copies pregame positions with no current player until the first increment.
     position.incrementTurn();
     if (!position.setCurrentPlayer(1)) throw std::runtime_error("Cannot set player");
     position.setBoard(board);
     position.setCurrentPlayerRack(Quackle::Rack(alphabet->encode(rackText)), false);
+    if (simSeconds > 0) {
+        // The real unseen tiles: the opponent's rack gets the right number of them
+        // (the simulator re-deals it from all unseen tiles every iteration; with
+        // the bag empty it is exact) and the bag the rest.
+        std::size_t oppSize = unseenText.size() - static_cast<std::size_t>(bagSize);
+        Quackle::Bag bag;
+        bag.clear();
+        if (bagSize > 0) bag.toss(alphabet->encode(unseenText.substr(oppSize)));
+        position.setBag(bag);
+        position.setOppRack(Quackle::Rack(alphabet->encode(unseenText.substr(0, oppSize))), false);
+        position.ensureBoardIsPreparedForAnalysis();
+        Quackle::SmartBogowin player;
+        Quackle::ComputerParameters parameters = player.parameters();
+        parameters.secondsPerTurn = simSeconds;
+        player.setParameters(parameters);
+        player.setThreadCount(1, Quackle::ThreadQoS::Balanced);
+        player.setPosition(position);
+        // The player prints its analysis to std::cout, which carries our protocol.
+        std::ostringstream discard;
+        auto* saved = std::cout.rdbuf(discard.rdbuf());
+        Quackle::Move move;
+        try {
+            move = player.move();
+        } catch (...) {
+            std::cout.rdbuf(saved);
+            throw;
+        }
+        std::cout.rdbuf(saved);
+        if (!std::isfinite(move.equity)) move.equity = 0;
+        // Quackle's endgame player passes by "exchanging"; with fewer than 7
+        // tiles in the bag an exchange is illegal, so report it as the pass it is.
+        if (move.action == Quackle::Move::Exchange && bagSize < 7) {
+            double equity = move.equity;
+            move = Quackle::Move::createPassMove();
+            move.equity = equity;
+        }
+        std::ostringstream answer;
+        answer << "MOVES 1\nEQUITY " << move.equity << "\n";
+        writeMove(answer, data, move, rackText);
+        out << answer.str();
+        return true;
+    }
     Quackle::Bag bag;
     bag.clear();
     // Static evaluation needs only bag size, never actual hidden bag contents.
@@ -174,7 +237,7 @@ bool solve(std::istream& in, std::ostream& out, Quackle::DataManager& data, int 
 
 int main(int argc, char* argv[]) {
     std::string lexicon = "target/quackle/demo.dawg";
-    int top = 0;
+    int top = 0, simSeconds = 0;
     bool serve = false;
     try {
         bool lexiconGiven = false;
@@ -186,17 +249,21 @@ int main(int argc, char* argv[]) {
                 if (i + 1 >= argc) throw std::runtime_error("--top needs a count");
                 top = std::atoi(argv[++i]);
                 if (top < 1 || top > 1000) throw std::runtime_error("--top must be 1..1000");
+            } else if (arg == "--sim") {
+                if (i + 1 >= argc) throw std::runtime_error("--sim needs seconds per turn");
+                simSeconds = std::atoi(argv[++i]);
+                if (simSeconds < 1 || simSeconds > 600) throw std::runtime_error("--sim must be 1..600");
             } else if (!lexiconGiven && arg.rfind("--", 0) != 0) {
                 lexicon = arg;
                 lexiconGiven = true;
             } else {
-                throw std::runtime_error("Expected [lexicon] [--top N] [--serve]");
+                throw std::runtime_error("Expected [lexicon] [--top N] [--sim SECONDS] [--serve]");
             }
         }
         Quackle::DataManager data;
         setup(data, lexicon);
         if (!serve) {
-            if (!solve(std::cin, std::cout, data, top)) throw std::runtime_error("Invalid position");
+            if (!solve(std::cin, std::cout, data, top, simSeconds)) throw std::runtime_error("Invalid position");
             return 0;
         }
         std::string line, request;
@@ -205,7 +272,7 @@ int main(int argc, char* argv[]) {
             if (line.find_first_not_of(" \t\r") == std::string::npos) continue;
             std::istringstream in(line);
             try {
-                solve(in, std::cout, data, top);
+                solve(in, std::cout, data, top, simSeconds);
             } catch (const std::exception& error) {
                 std::cout << "ERROR " << error.what() << "\n";
             }
