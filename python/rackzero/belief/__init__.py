@@ -131,6 +131,57 @@ def _counts(rng: np.random.Generator, sizes: list[int], n: int) -> np.ndarray:
     return rng.multivariate_hypergeometric(np.asarray(sizes, dtype=np.int64), n)
 
 
+class LeaveLikelihood:
+    """Opponent model "players keep their best tiles": P(public action | full rack).
+
+    Relative, not absolute: a placement that leaves ``k`` tiles is more likely
+    from racks where the kept tiles are close to the best k tiles that rack could
+    have kept, by the heuristic leave formula ``rackzero.search.rack_value``
+    (points): P = exp(-beta * (best k-tile leave - actual leave)) <= 1. (Word
+    constraints are ignored: any k-subset counts as keepable.) An exchange of n
+    tiles is likelier from racks whose best (7-n)-tile keep is much better than
+    keeping everything. Passes carry no information. beta is in 1/points.
+    """
+
+    def __init__(self, beta: float):
+        if not np.isfinite(beta) or beta <= 0:
+            raise ValueError("beta must be finite and positive")
+        self.beta = float(beta)
+
+    @staticmethod
+    def best_keep(rack: np.ndarray, k: int) -> float:
+        from itertools import combinations
+        from rackzero.search import rack_value
+        tiles = np.repeat(np.arange(27), np.asarray(rack, dtype=np.int64))
+        if k <= 0:
+            return rack_value(np.zeros(27, dtype=np.int64))
+        if k >= len(tiles):
+            return rack_value(rack)
+        best = -np.inf
+        for subset in set(combinations(tiles.tolist(), k)):
+            best = max(best, rack_value(np.bincount(subset, minlength=27)))
+        return float(best)
+
+    def __call__(self, info: InformationState, event: PublicEvent, rack: np.ndarray) -> float:
+        from rackzero.search import rack_value
+        rack = np.asarray(rack, dtype=np.int64)
+        if event.kind == "place":
+            leave = rack - np.asarray(event.played, dtype=np.int64)
+            gap = self.best_keep(rack, int(leave.sum())) - rack_value(leave)
+        elif event.kind == "exchange":
+            keep = int(rack.sum()) - int(event.exchange_count)
+            # how much better than its whole rack this rack's best keep is
+            gap = max(0.0, rack_value(rack) - self.best_keep(rack, keep) + 10.0)
+        else:
+            return 1.0
+        return float(np.exp(-self.beta * max(0.0, gap)))
+
+
+def leave_likelihood(beta: float) -> "LeaveLikelihood | None":
+    """The ``search.belief_beta`` opponent model (None = uniform, the default)."""
+    return LeaveLikelihood(beta) if beta > 0 else None
+
+
 class RackBelief:
     """Rao-Blackwellized particle filter over the opponent's hidden rack.
 

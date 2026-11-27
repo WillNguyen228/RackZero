@@ -62,6 +62,9 @@ TARGET_FIELDS = {
     "action": ((), np.int16),
     "q_target": ((), np.float32),
     "q_weight": ((), np.float32),
+    # TD(lambda) P(mover wins) target for the candidate played (win head), weight 0/1.
+    "qwin_target": ((), np.float32),
+    "qwin_weight": ((), np.float32),
 }
 
 
@@ -76,7 +79,8 @@ def fill_target_defaults(batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     if "policy" in batch:
         n = len(batch["policy"])
         for name, dtype in (("action", np.int16), ("q_target", np.float32),
-                            ("q_weight", np.float32)):
+                            ("q_weight", np.float32), ("qwin_target", np.float32),
+                            ("qwin_weight", np.float32)):
             if name not in batch:
                 batch[name] = np.zeros(n, dtype=dtype)
     return batch

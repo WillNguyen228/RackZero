@@ -173,16 +173,30 @@ bool solve(std::istream& in, std::ostream& out, Quackle::DataManager& data, int 
         std::size_t oppSize = unseenText.size() - static_cast<std::size_t>(bagSize);
         Quackle::Bag bag;
         bag.clear();
-        if (bagSize > 0) bag.toss(alphabet->encode(unseenText.substr(oppSize)));
-        position.setBag(bag);
+        // One tile at a time: encode() returns a fixed-capacity LetterString
+        // (sized for racks and words) that silently truncates a whole bag.
+        for (std::size_t i = oppSize; i < unseenText.size(); ++i)
+            bag.toss(alphabet->encode(unseenText.substr(i, 1)));
+        if (static_cast<int>(bag.size()) != bagSize) throw std::runtime_error("Bag encoding failed");
+        // setOppRack throws the opponent's previous rack (dealt when the position
+        // was created) back into the bag, so the bag is set afterwards.
         position.setOppRack(Quackle::Rack(alphabet->encode(unseenText.substr(0, oppSize))), false);
+        position.setBag(bag);
+        if (static_cast<int>(position.unseenBag().size()) != static_cast<int>(unseenText.size()))
+            throw std::runtime_error("Unseen tiles do not match after setup");
         position.ensureBoardIsPreparedForAnalysis();
         Quackle::SmartBogowin player;
         Quackle::ComputerParameters parameters = player.parameters();
         parameters.secondsPerTurn = simSeconds;
         player.setParameters(parameters);
         player.setThreadCount(1, Quackle::ThreadQoS::Balanced);
+        if (std::getenv("QUACKLE_BRIDGE_DEBUG"))
+            std::cerr << "SETUP bag " << position.bag().size() << " opp rack "
+                      << position.oppRack().tiles().size() << " unseen " << position.unseenBag().size() << std::endl;
         player.setPosition(position);
+        if (std::getenv("QUACKLE_BRIDGE_DEBUG"))
+            std::cerr << "AFTER setPosition bag " << player.currentPosition().bag().size()
+                      << " unseen " << player.currentPosition().unseenBag().size() << std::endl;
         // The player prints its analysis to std::cout, which carries our protocol.
         std::ostringstream discard;
         auto* saved = std::cout.rdbuf(discard.rdbuf());
@@ -194,6 +208,14 @@ bool solve(std::istream& in, std::ostream& out, Quackle::DataManager& data, int 
             throw;
         }
         std::cout.rdbuf(saved);
+        if (std::getenv("QUACKLE_BRIDGE_DEBUG")) {
+            std::cerr << "POSITION\n" << player.currentPosition() << "\nSPREAD "
+                      << player.currentPosition().spread() << " BAG "
+                      << player.currentPosition().bag().size() << " UNSEEN "
+                      << player.currentPosition().unseenBag().size() << "\nOUTPUT\n"
+                      << discard.str().substr(0, 3000) << "\nCHOSEN " << move << " win "
+                      << move.win << " equity " << move.equity << std::endl;
+        }
         if (!std::isfinite(move.equity)) move.equity = 0;
         // Quackle's endgame player passes by "exchanging"; with fewer than 7
         // tiles in the bag an exchange is illegal, so report it as the pass it is.

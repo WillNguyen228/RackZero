@@ -103,7 +103,9 @@ class WorkerContext:
             self._models[ref.tag] = evaluator
         return self._models[ref.tag]
 
-    def game_factory(self, particles: int, rng: np.random.Generator):
+    def game_factory(self, particles: int, rng: np.random.Generator, belief_beta: float = 0.0):
+        from rackzero.belief import leave_likelihood
+        self.game._likelihood = leave_likelihood(belief_beta)
         self.game._particles = particles
         self.game._rng, self.game._external_rng = rng, True
         return self.game
@@ -149,6 +151,29 @@ class SelfPlayTask:
     explore_epsilon: float = 0.0
     q_head: bool = False
     luck_samples: int = 0
+    win_head: bool = False
+
+
+def td_win_targets(players, win_taken, final_scores, lam: float) -> list[float]:
+    """TD(lambda) P(mover wins) targets for every ply of a finished game.
+
+    For ply i by player p with j = i + 2 its next own turn:
+    G_i = (1 - lam) * W_j + lam * G_j, W_j the acting network's (or exact endgame
+    search's) P(win) for the move played at j (Monte Carlo G_j when unknown), and
+    G_i = 1 / 0.5 / 0 for a win / tie / loss on p's last own turn.
+    """
+    n = len(players)
+    returns = [0.0] * n
+    for i in range(n - 1, -1, -1):
+        p = players[i]
+        j = i + 2
+        if j < n and players[j] == p:
+            returns[i] = returns[j] if win_taken[j] is None else (
+                (1 - lam) * win_taken[j] + lam * returns[j])
+        else:
+            margin = float(final_scores[p] - final_scores[1 - p])
+            returns[i] = 1.0 if margin > 0 else (0.5 if margin == 0 else 0.0)
+    return returns
 
 
 def td_lambda_targets(spreads, players, q_taken, final_scores, lam: float,
@@ -263,11 +288,14 @@ def play_selfplay_game(ctx: WorkerContext, task: SelfPlayTask) -> dict:
     cap_rng = np.random.default_rng(cap_seq)
     full_moves = 0
     game = ctx.game
+    from rackzero.belief import leave_likelihood
+    game._likelihood = leave_likelihood(full_config.belief_beta)   # applied at reset
     before = _counters(ctx, evaluator)
     started = time.perf_counter()
     live_movegen = search_seconds = step_seconds = 0.0
     records, players = [], []
     spreads, q_taken = [], []   # mover's spread before each ply; Q of the move played
+    win_taken = []              # P(win) of the move played (win head / exact endgame)
     luck, leaves = [], {}       # draw luck per ply; each player's leave after their move
     luck_rng = np.random.default_rng(np.random.SeedSequence(task.seed).spawn(5)[4])
     info = game.reset(seed=int(game_seq.generate_state(1)[0] % 2**31),
@@ -323,6 +351,8 @@ def play_selfplay_game(ctx: WorkerContext, task: SelfPlayTask) -> dict:
                 spreads.append(float(scores_before[players[-1]] - scores_before[1 - players[-1]]))
             q_values = getattr(result, "q", None)
             q_taken.append(None if q_values is None else float(q_values[selected]))
+            win_values = getattr(result, "win", None)
+            win_taken.append(None if win_values is None else float(win_values[selected]))
             mover = players[-1]
             if task.luck_samples and task.q_head and leaves.get(mover) is not None:
                 luck.append(draw_luck(ctx, search, game, info, leaves[mover],
@@ -365,6 +395,10 @@ def play_selfplay_game(ctx: WorkerContext, task: SelfPlayTask) -> dict:
                     spreads, players, q_taken, scores, task.td_lambda, luck)):
                 record["q_target"] = np.float32(target)
                 record["q_weight"] = np.float32(1.0)
+            for record, target in zip(records, td_win_targets(
+                    players, win_taken, scores, task.td_lambda)):
+                record["qwin_target"] = np.float32(target)
+                record["qwin_weight"] = np.float32(1.0 if task.win_head else 0.0)
         batch = stack_records(records)
         stats["positions"] = len(records)
     else:
@@ -666,6 +700,15 @@ class RemoteEvaluator:
         if "q" not in out:
             raise ValueError("This network has no Q head (model.q_head: false)")
         return q_outputs(out, len(moves))
+
+    def predict_qwin(self, info, moves, belief_mean=None):
+        from rackzero.features import belief_from_mean
+        from rackzero.models.networks import q_outputs, win_outputs
+        out = self._call(encode_record(info, moves, belief_from_mean(info, belief_mean),
+                                       len(moves)), True)
+        if "q" not in out:
+            raise ValueError("This network has no Q head (model.q_head: false)")
+        return (*q_outputs(out, len(moves)), win_outputs(out, len(moves)))
 
     def predict_value(self, info, belief_mean=None):
         from rackzero.features import belief_from_mean

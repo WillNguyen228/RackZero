@@ -162,6 +162,7 @@ class TrainingConfig:
     # Leela Chess Zero / KataGo). 0 = outcome only (original).
     value_target_q_weight: float = 0.0
     q_loss_weight: float = 1.0        # Q-head TD loss (model.q_head only)
+    win_loss_weight: float = 1.0      # win-head TD cross-entropy (model.win_head only)
 
     def __post_init__(self):
         for name in ("steps_per_iteration", "batch_size", "min_replay", "lr_step_size"):
@@ -179,7 +180,8 @@ class TrainingConfig:
         if self.learning_rate <= 0:
             raise ValueError("training.learning_rate must be positive")
         for name in ("weight_decay", "momentum", "grad_clip", "policy_loss_weight",
-                     "value_loss_weight", "margin_loss_weight", "q_loss_weight"):
+                     "value_loss_weight", "margin_loss_weight", "q_loss_weight",
+                     "win_loss_weight"):
             _finite("training", name, getattr(self, name), 0)
         _finite("training", "lr_min_factor", self.lr_min_factor, 0, 1)
         _finite("training", "lr_gamma", self.lr_gamma, 0, 1)

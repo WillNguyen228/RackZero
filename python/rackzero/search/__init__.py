@@ -12,7 +12,7 @@ from scrabble_gym.environment import ScoredMove
 
 METHODS = ("stochastic", "pimc", "ismcts", "belief", "neural_determinization")
 ROOT_SELECTIONS = ("puct", "gumbel", "crn", "q")
-CRN_LEAVES = ("value", "margin", "spread", "equity", "q")
+CRN_LEAVES = ("value", "margin", "spread", "equity", "q", "qraw")
 SHORTLISTS = ("score", "mixed")
 
 
@@ -59,6 +59,15 @@ class SearchConfig:
     # head (spread-to-go / 100); the policy target is the softmax of that score.
     q_prior_weight: float = 1.0
     q_temperature: float = 2.0       # points of Q per nat
+    # q_objective "win" (needs model.win_head): rank by the win head's P(win)
+    # instead of Q, converted to points near an even game: sigma(u) * sqrt(2 pi) *
+    # (P - 1/2), with sigma(u) = q_sigma_a + q_sigma_b * u the spread uncertainty
+    # at u unseen tiles (fitted on td4 self-play: 19.1 + 0.876 u); Q breaks ties
+    # with weight q_win_tiebreak.
+    q_objective: str = "spread"
+    q_sigma_a: float = 19.1
+    q_sigma_b: float = 0.876
+    q_win_tiebreak: float = 0.1
     # Late-game search (off by default). endgame_playout: with the bag empty the
     # position is exact (the opponent's rack is the unseen tiles), so every
     # candidate is played out to the end (at most endgame_plies plies) with both
@@ -74,6 +83,17 @@ class SearchConfig:
     endgame_plies: int = 40
     crn_bag: int = 0
     crn_reply: str = "prior"
+    # crn_shrink_tau > 0 (points; needs crn_leaf "qraw", i.e. leaves scored as
+    # spread + 100 Q in points, not squashed): combine each candidate's simulated
+    # value with the network's own estimate (Q at the root) instead of replacing it.
+    # Per sample, values are centred across candidates (common luck removed); the
+    # candidate's mean then updates a prior centred on its Q with sd tau, weighted
+    # by the mean's standard error (Bayesian shrinkage). 0 = plain mean (original).
+    crn_shrink_tau: float = 0.0
+    # Opponent-rack inference: weight belief particles by "players keep good
+    # tiles" (rackzero.belief.LeaveLikelihood) with this strength in 1/points;
+    # 0 = every tile-consistent rack equally likely (the original).
+    belief_beta: float = 0.0
 
     def __post_init__(self):
         if self.method not in METHODS:
@@ -124,6 +144,21 @@ class SearchConfig:
                 raise ValueError(f"{name} must be an integer >= {low}")
         if not isinstance(self.endgame_playout, bool):
             raise ValueError("endgame_playout must be true or false")
+        if (isinstance(self.belief_beta, bool) or not isinstance(self.belief_beta, (int, float))
+                or not math.isfinite(self.belief_beta) or self.belief_beta < 0):
+            raise ValueError("belief_beta must be finite and nonnegative")
+        if self.q_objective not in ("spread", "win"):
+            raise ValueError("q_objective must be spread or win")
+        for name in ("q_sigma_a", "q_sigma_b", "q_win_tiebreak"):
+            value = getattr(self, name)
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                raise ValueError(f"{name} must be finite and nonnegative")
+        if (isinstance(self.crn_shrink_tau, bool) or not isinstance(self.crn_shrink_tau, (int, float))
+                or not math.isfinite(self.crn_shrink_tau) or self.crn_shrink_tau < 0):
+            raise ValueError("crn_shrink_tau must be finite and nonnegative")
+        if self.crn_shrink_tau > 0 and self.crn_leaf != "qraw":
+            raise ValueError("crn_shrink_tau needs crn_leaf qraw (leaves in points)")
         if self.crn_reply not in ("prior", "q"):
             raise ValueError("crn_reply must be prior or q")
         for name in ("gumbel_c_visit", "gumbel_c_scale", "gumbel_scale"):
@@ -142,6 +177,7 @@ class SearchResult:
     chance_outcomes: int = 0
     selected: int | None = None   # Gumbel root: the action to play (None for PUCT)
     q: np.ndarray | None = None   # root_selection "q": every candidate's Q (points / 100)
+    win: np.ndarray | None = None  # P(mover wins) per candidate (win head or exact endgame)
 
 
 def leave_values(observation: dict, moves: tuple[ScoredMove, ...]) -> np.ndarray:
@@ -438,15 +474,17 @@ class Search:
                 spread += rack_value(world.racks[root]) - rack_value(world.racks[1 - root])
             return math.tanh(spread / 100)
         info = world.information()
-        if leaf == "q":
+        if leaf in ("q", "qraw"):
             # Spread now plus the Q head's spread-to-go for the move the Q agent
-            # would play here (leaf player's view).
+            # would play here (leaf player's view); "qraw" keeps it in points / 100.
             obs = info.observation
             player = int(obs["player"])
             moves = self._shortlist(self.simulator.legal_moves(world, self.rng), info)
             score, q = self._q_pick(info, moves)
             spread = float(obs["scores"][player] - obs["scores"][1 - player])
-            value = math.tanh((spread + 100 * float(q[int(np.argmax(score))])) / 100)
+            value = (spread + 100 * float(q[int(np.argmax(score))])) / 100
+            if leaf == "q":
+                value = math.tanh(value)
             return value if player == root else -value
         if leaf == "margin" and hasattr(self.model, "predict_value"):
             value = math.tanh(self.model.predict_value(info)[1] / 100)
@@ -506,8 +544,9 @@ class Search:
         selected = int(np.argmax(finals))
         z = 100 * q / c.q_temperature
         policy = np.exp(z - z.max())
+        win = (finals > 0) + 0.5 * (finals == 0)
         return SearchResult(moves, policy / policy.sum(), np.ones(len(moves), dtype=np.int64),
-                            float(np.clip(q[selected], -1, 1)), 0, selected, q)
+                            float(np.clip(q[selected], -1, 1)), 0, selected, q, win)
 
     def _crn_rollout(self, world: World, root: int, move, seed: int) -> float:
         """Root move, then crn_plies - 1 argmax-policy plies, then the leaf.
@@ -528,24 +567,51 @@ class Search:
         c = self.config
         prior, prior_value = self._prediction(info, moves, mean)
         prior = np.asarray(prior, dtype=np.float64)
+        root_q = None
+        if c.crn_reply == "q" or c.crn_shrink_tau > 0:
+            score, root_q = self._q_pick(info, moves, mean)
         if c.crn_reply == "q":   # rank (and prior) by the Q agent's score
-            score = self._q_pick(info, moves, mean)[0]
             prior = np.exp(score - score.max())
         prior = prior / prior.sum()
         k = min(c.crn_candidates, len(moves))
         candidates = np.argsort(-prior, kind="stable")[:k]
         samples = max(1, c.simulations // k)
+        if c.crn_shrink_tau > 0 and samples < 2:
+            # One sample has no measurable spread, so shrinkage would return the
+            # network's own choice: skip the rollouts (playout-cap "fast" moves).
+            return self._q_root(moves, info, mean)
         visits = np.zeros(len(moves), dtype=np.int64)
         totals = np.zeros(len(moves))
-        for _ in range(samples):
+        values = np.zeros((samples, len(candidates)))
+        for s in range(samples):
             world = self.simulator.determinize(info, belief.sample())
             seed = int(self.rng.integers(0, 2**63 - 1))
-            for action in candidates:
-                totals[action] += self._crn_rollout(world, root, moves[action], seed)
+            for j, action in enumerate(candidates):
+                values[s, j] = self._crn_rollout(world, root, moves[action], seed)
+                totals[action] += values[s, j]
                 visits[action] += 1
         visited = visits > 0
         q = np.where(visited, totals / np.maximum(1, visits), 0.0)
         selected = int(candidates[int(np.argmax(q[candidates]))])
+        if c.crn_shrink_tau > 0 and len(candidates) > 1:
+            centred = 100 * (values - values.mean(axis=1, keepdims=True))   # points
+            evidence = centred.mean(axis=0)
+            se2 = (centred.var(axis=0, ddof=1) / samples if samples > 1
+                   else np.full(len(candidates), np.inf))
+            se2 = np.maximum(se2, 1e-6)
+            prior_mean = 100 * root_q[candidates]
+            prior_mean = prior_mean - prior_mean.mean()
+            tau2 = c.crn_shrink_tau ** 2
+            posterior = (prior_mean / tau2 + evidence / se2) / (1 / tau2 + 1 / se2)
+            selected = int(candidates[int(np.argmax(posterior))])
+            if c.crn_reply == "q":
+                # Policy target: the Q agent's softmax with each searched candidate's
+                # value replaced by its shrunk estimate (not the noisy raw mean).
+                z = score.astype(np.float64).copy()
+                z[candidates] += (posterior - prior_mean) / c.q_temperature
+                policy = np.exp(z - z.max())
+                return SearchResult(moves, policy / policy.sum(), visits, float(q[selected]), 0,
+                                    selected, np.asarray(root_q, dtype=np.float64))
         # Improved policy as in Gumbel AlphaZero: completed Q-values (unsearched
         # candidates get the prior-weighted mix value) added to the prior logits.
         mass = float(prior[visited].sum())
@@ -554,19 +620,36 @@ class Search:
         completed = np.where(visited, q, v_mix)
         z = np.log(np.maximum(prior, 1e-12)) + self._sigma(completed, visits)
         policy = np.exp(z - z.max())
-        return SearchResult(moves, policy / policy.sum(), visits, float(q[selected]), 0, selected)
+        # With the Q agent's values available, report them (the network's own estimates,
+        # not the sampled ones) so self-play can bootstrap TD targets from them.
+        return SearchResult(moves, policy / policy.sum(), visits, float(q[selected]), 0, selected,
+                            None if root_q is None else np.asarray(root_q, dtype=np.float64))
 
     def _q_root(self, moves, info, mean) -> SearchResult:
         """No search: rank candidates by the policy prior plus the Q head."""
         c = self.config
-        prior, q = self.model.predict_q(info, moves, mean)
+        win = None
+        if hasattr(self.model, "predict_qwin"):
+            prior, q, win = self.model.predict_qwin(info, moves, mean)
+        else:
+            prior, q = self.model.predict_q(info, moves, mean)
         q = np.asarray(q, dtype=np.float64)
-        score = (c.q_prior_weight * np.log(np.maximum(np.asarray(prior, dtype=np.float64), 1e-12))
-                 + 100 * q / c.q_temperature)
+        log_prior = c.q_prior_weight * np.log(np.maximum(np.asarray(prior, dtype=np.float64), 1e-12))
+        if c.q_objective == "win":
+            if win is None:
+                raise ValueError("search.q_objective win needs a network with model.win_head")
+            obs = info.observation
+            unseen = int(obs["bag_size"]) + int(obs["opponent_rack_size"])
+            sigma = c.q_sigma_a + c.q_sigma_b * unseen
+            points = sigma * math.sqrt(2 * math.pi) * (np.asarray(win, dtype=np.float64) - 0.5)
+            score = log_prior + (points + c.q_win_tiebreak * 100 * q) / c.q_temperature
+        else:
+            score = log_prior + 100 * q / c.q_temperature
         policy = np.exp(score - score.max())
         selected = int(np.argmax(score))
         return SearchResult(moves, policy / policy.sum(), np.zeros(len(moves), dtype=np.int64),
-                            float(np.clip(q[selected], -1, 1)), 0, selected, q)
+                            float(np.clip(q[selected], -1, 1)), 0, selected, q,
+                            None if win is None else np.asarray(win, dtype=np.float64))
 
     def run(self, info: InformationState, moves=None, belief: RackBelief | None = None,
             root_features: np.ndarray | None = None):

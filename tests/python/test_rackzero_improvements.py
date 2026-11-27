@@ -208,6 +208,38 @@ class CrnTest(Quiet):
             self.assertTrue(-1 <= result.value <= 1)
             self.assertGreater(result.visits[result.selected], 0)
 
+    def test_shrinkage_interpolates_between_q_and_simulation(self):
+        game, info, moves = opening_position()
+        simulator = Simulator(TinyLexicon().words)
+        self.addCleanup(game.close)
+        self.addCleanup(simulator.close)
+        torch.manual_seed(0)
+        model = build_model(dict(SMALL, q_head=True))
+        torch.nn.init.normal_(model.q[-1].weight, std=0.5)   # distinct Q per move
+        evaluator = NetworkEvaluator(model)
+
+        def run(**changes):
+            config = SearchConfig(**{"simulations": 24, "candidates": 12, "root_selection": "crn",
+                                     "crn_candidates": 4, "crn_leaf": "qraw", "crn_reply": "q",
+                                     "q_prior_weight": 0.0, **changes})
+            return Search(simulator, evaluator, config, np.random.default_rng(4)).run(info, moves)
+        plain = run()
+        trusting_q = run(crn_shrink_tau=1e-6)
+        trusting_sims = run(crn_shrink_tau=1e6)
+        _, q = evaluator.predict_q(info, plain.moves)
+        searched = np.flatnonzero(plain.visits)
+        self.assertEqual(trusting_q.selected, int(searched[np.argmax(q[searched])]))
+        self.assertEqual(trusting_sims.selected, plain.selected)
+        np.testing.assert_allclose(plain.q, q)   # the network's values, for TD bootstrapping
+        # Shrinkage policy targets put the most mass on the chosen move, and one sample
+        # per candidate skips the rollouts and plays the network's own choice.
+        self.assertEqual(int(np.argmax(trusting_sims.policy)), trusting_sims.selected)
+        one = run(crn_shrink_tau=5.0, simulations=4)
+        self.assertEqual(int(one.visits.sum()), 0)
+        self.assertEqual(one.selected, int(np.argmax(q)))
+        with self.assertRaises(ValueError):
+            SearchConfig(crn_shrink_tau=5.0, crn_leaf="q")
+
 
 @unittest.skipUnless(HAS_LEARNING, "Install the learning extra")
 class TargetsTest(Quiet):
@@ -261,12 +293,13 @@ class TargetsTest(Quiet):
         buffer = ReplayBuffer(10, CANDIDATES)
         state = buffer.state_dict()
         records = {k: v for k, v in state["records"].items() if k not in
-                   ("search_value", "policy_weight", "action", "q_target", "q_weight")}
+                   ("search_value", "policy_weight", "action", "q_target", "q_weight",
+                    "qwin_target", "qwin_weight")}
         state["records"] = records
         ReplayBuffer(10, CANDIDATES).load_state_dict(state)
         self.assertEqual(set(TARGET_FIELDS), {"policy", "win", "margin", "search_value",
                                               "policy_weight", "action", "q_target",
-                                              "q_weight"})
+                                              "q_weight", "qwin_target", "qwin_weight"})
 
 
 @unittest.skipUnless(HAS_LEARNING, "Install the learning extra")
@@ -449,6 +482,122 @@ class QHeadTest(Quiet):
 
 
 @unittest.skipUnless(HAS_LEARNING, "Install the learning extra")
+class WinHeadTest(Quiet):
+    def test_td_win_targets_by_hand(self):
+        from rackzero.workers import td_win_targets
+        # p0 plays plies 0 and 2, p1 plays 1 and 3; p0 wins.
+        targets = td_win_targets([0, 1, 0, 1], [None, None, 0.8, 0.3], [400, 350], 0.5)
+        np.testing.assert_allclose(targets, [0.5 * 0.8 + 0.5 * 1.0, 0.5 * 0.3, 1.0, 0.0])
+        self.assertEqual(td_win_targets([0, 1], [None, None], [300, 300], 0.5), [0.5, 0.5])
+
+    def test_head_starts_even_and_objective_changes_the_pick(self):
+        game, info, moves = opening_position()
+        simulator = Simulator(TinyLexicon().words)
+        self.addCleanup(game.close)
+        self.addCleanup(simulator.close)
+        torch.manual_seed(0)
+        evaluator = NetworkEvaluator(build_model(dict(SMALL, q_head=True, win_head=True)))
+        _, _, win = evaluator.predict_qwin(info, moves[:5])
+        np.testing.assert_allclose(win, 0.5)
+        with self.assertRaises(ValueError):
+            Search(simulator, NetworkEvaluator(build_model(dict(SMALL, q_head=True))),
+                   SearchConfig(candidates=12, root_selection="q", q_objective="win"),
+                   np.random.default_rng(0)).run(info, moves)
+
+        class Stub:   # move 0: more points; move 1: more wins
+            def predict_qwin(self, info, moves, mean=None):
+                n = len(moves)
+                q, win = np.zeros(n), np.full(n, 0.3)
+                q[0], win[0] = 0.10, 0.40
+                q[1], win[1] = 0.05, 0.60
+                return np.full(n, 1 / n), q, win
+
+        def pick(objective):
+            config = SearchConfig(candidates=12, root_selection="q", q_prior_weight=0.0,
+                                  q_objective=objective)
+            result = Search(simulator, Stub(), config, np.random.default_rng(0)).run(info, moves)
+            np.testing.assert_allclose(result.win[:2], [0.4, 0.6])
+            return int(result.selected)
+        self.assertEqual(pick("spread"), 0)
+        self.assertEqual(pick("win"), 1)
+
+    def test_self_play_trains_the_win_head_and_init_from_adds_it(self):
+        source = Trainer(config_for(self.directory, **{"model.q_head": True}),
+                         run_dir=self.directory / "a")
+        path = self.directory / "a" / "source.pt"
+        torch.save(source.checkpoint(include_replay=False), path)
+        source.close()
+        trainer = Trainer(config_for(self.directory, init_from=str(path).replace("\\", "/"), **{
+            "model.q_head": True, "model.win_head": True, "search.root_selection": "q",
+            "search.q_objective": "win", "search.endgame_playout": True}),
+            run_dir=self.directory / "b")
+        try:
+            state = trainer.model.state_dict()
+            self.assertTrue(any(k.startswith("qwin.") for k in state))
+            trainer.self_play()
+            replay = trainer.replay.ordered()
+            np.testing.assert_array_equal(replay["qwin_weight"], 1.0)
+            self.assertTrue(np.all((replay["qwin_target"] >= 0) & (replay["qwin_target"] <= 1)))
+            before = {k: v.clone() for k, v in trainer.model.state_dict().items()
+                      if k.startswith("qwin.")}
+            training = trainer.optimize()
+            self.assertGreater(training["win_loss"], 0)
+            after = trainer.model.state_dict()
+            self.assertTrue(any(not torch.equal(before[k], after[k]) for k in before))
+        finally:
+            trainer.close()
+        with self.assertRaises(ValueError):
+            build_model(dict(SMALL, win_head=True))
+
+
+@unittest.skipUnless(HAS_LEARNING, "Install the learning extra")
+class OpponentInferenceTest(Quiet):
+    def test_leave_likelihood_prefers_good_leaves(self):
+        from rackzero.belief import LeaveLikelihood, leave_likelihood
+        from rackzero.game import PublicEvent, counts
+        model = LeaveLikelihood(0.3)
+
+        def place(letters):
+            return PublicEvent(1, "place", tuple(int(x) for x in counts(letters)), 0, 22, 50, 7)
+        rack = counts("QAERS??")
+        # Relative: from the same rack, playing the Q (keeping AERS??) is likelier
+        # than playing the A (keeping the Q); keeping the best tiles costs nothing.
+        self.assertEqual(model(None, place("Q"), rack), 1.0)
+        self.assertLess(model(None, place("A"), rack), model(None, place("Q"), rack))
+        # A bad rack keeping its best tiles is not penalised for being bad.
+        self.assertEqual(model(None, place("Q"), counts("QUUVVWW")), 1.0)
+        exchange = PublicEvent(1, "exchange", tuple([0] * 27), 4, 0, 50, 7)
+        self.assertGreater(model(None, exchange, counts("UUVVWWE")), model(None, exchange, rack))
+        self.assertEqual(model(None, PublicEvent(1, "pass", tuple([0] * 27), 0, 0, 50, 7), rack),
+                         1.0)
+        self.assertIsNone(leave_likelihood(0.0))
+        for bad_beta in (-1.0, float("nan")):
+            with self.assertRaises(ValueError):
+                SearchConfig(belief_beta=bad_beta)
+
+    def test_inference_keeps_beliefs_consistent_and_self_play_runs(self):
+        from rackzero.belief import leave_likelihood
+        words = TinyLexicon().words
+        game = Game(words, particles=16, rng=np.random.default_rng(0),
+                    belief_likelihood=leave_likelihood(0.3))
+        self.addCleanup(game.close)
+        info = game.reset(seed=1)
+        for _ in range(60):   # RackBelief checks tile conservation after every update
+            moves = game.legal_moves()
+            info, terminal, truncated = game.step(max(moves, key=lambda m: m.score).move)
+            np.testing.assert_allclose(game.belief.expected().sum(),
+                                       info.observation["opponent_rack_size"], atol=1e-6)
+            if terminal or truncated:
+                break
+        trainer = Trainer(config_for(self.directory, **{
+            "model.q_head": True, "search.root_selection": "q", "search.belief_beta": 0.3}),
+            run_dir=self.directory / "infer")
+        try:
+            self.assertGreater(trainer.self_play()["new_positions"], 5)
+        finally:
+            trainer.close()
+
+
 class AfterstateTest(Quiet):
     def test_afterstate_inputs_match_the_played_position(self):
         from rackzero.features import to_tensors

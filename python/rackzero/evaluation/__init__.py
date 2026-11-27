@@ -57,10 +57,11 @@ def play_game(words, simulator, model, baseline, opponent, config, opponent_conf
                 for player in (0, 1)]
     belief_rng = np.random.default_rng(np.random.SeedSequence([game_seed, 2]))
     if game_factory is None:
+        from rackzero.belief import leave_likelihood
         game = Game(words, max_turns=max_turns, particles=config.particles, rng=belief_rng,
-                    movegen=config.movegen)
+                    movegen=config.movegen, belief_likelihood=leave_likelihood(config.belief_beta))
     else:
-        game = game_factory(config.particles, belief_rng)
+        game = game_factory(config.particles, belief_rng, config.belief_beta)
     regret = 0.0
     decisions = turns = 0
     try:

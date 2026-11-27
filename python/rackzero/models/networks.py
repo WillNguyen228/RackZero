@@ -69,6 +69,10 @@ class ModelConfig:
     # candidates ranked highest by log prior + Q. Needs ``q_head``.
     after_head: bool = False
     after_top: int = 12
+    # Win head: per-candidate P(mover wins | candidate played), as a logit; trained
+    # by TD(lambda) on the game result. Lets the agent play for wins rather than
+    # points (search.q_objective: win). Needs ``q_head``.
+    win_head: bool = False
     legacy_hidden: int = 128
 
     def __post_init__(self):
@@ -96,6 +100,8 @@ class ModelConfig:
             raise ValueError("model.margin_head must be a boolean")
         if self.after_head and not self.q_head:
             raise ValueError("model.after_head requires model.q_head")
+        if self.win_head and not self.q_head:
+            raise ValueError("model.win_head requires model.q_head")
 
     @classmethod
     def from_dict(cls, values: dict) -> "ModelConfig":
@@ -282,6 +288,12 @@ class RackZeroNet(nn.Module):
             # Zero output at initialization: a warm-started network first plays its policy.
             nn.init.zeros_(self.q[-1].weight)
             nn.init.zeros_(self.q[-1].bias)
+        self.qwin = None
+        if c.win_head:
+            self.qwin = _mlp([3 * c.move_dim, c.policy_hidden, 1], c.dropout, final_activation=False)
+            # Logit 0 (P = 0.5) at initialization.
+            nn.init.zeros_(self.qwin[-1].weight)
+            nn.init.zeros_(self.qwin[-1].bias)
         self.after = None
         if c.after_head:
             self.after = nn.Linear(c.value_hidden, 1)
@@ -361,6 +373,8 @@ class RackZeroNet(nn.Module):
         out["logits"] = logits.squeeze(-1).float().masked_fill(~mask, float("-inf"))
         if self.q is not None:
             out["q"] = self.q(joint).squeeze(-1).float().masked_fill(~mask, 0.0)
+        if self.qwin is not None:
+            out["qwin"] = self.qwin(joint).squeeze(-1).float().masked_fill(~mask, 0.0)
         if self.after is not None:
             if self.training:
                 # Training: afterstate value of the move actually played.
@@ -448,6 +462,13 @@ def parameter_count(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
+def win_outputs(out: dict, n: int):
+    """P(mover wins) per candidate from the win head's logits, or None without one."""
+    if "qwin" not in out:
+        return None
+    return 1 / (1 + np.exp(-np.asarray(out["qwin"], dtype=np.float64)[:n]))
+
+
 def q_outputs(out: dict, n: int):
     """(policy probabilities, move values / 100) from one record's network outputs.
 
@@ -510,6 +531,15 @@ class NetworkEvaluator:
         if "q" not in out:
             raise ValueError("This network has no Q head (model.q_head: false)")
         return q_outputs({k: v[0] for k, v in out.items()}, len(moves))
+
+    def predict_qwin(self, info, moves, belief_mean=None):
+        """(policy probabilities, Q / 100, P(win) per candidate or None)."""
+        record = encode_record(info, moves, belief_from_mean(info, belief_mean), len(moves))
+        out = self._run([record], policy=True)
+        if "q" not in out:
+            raise ValueError("This network has no Q head (model.q_head: false)")
+        one = {k: v[0] for k, v in out.items()}
+        return (*q_outputs(one, len(moves)), win_outputs(one, len(moves)))
 
     def predict_value(self, info, belief_mean=None):
         from scrabble_gym.environment import Move, ScoredMove

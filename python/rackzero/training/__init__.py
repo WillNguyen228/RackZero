@@ -161,6 +161,14 @@ def compute_losses(out: dict, batch: dict, training, value_head: str) -> dict:
         q_loss = ((q_weight * (q_taken - batch["q_target"]).square()).sum()
                   / q_weight.sum().clamp_min(1.0))
         total = total + getattr(training, "q_loss_weight", 1.0) * q_loss
+    win_loss = torch.zeros((), device=total.device)
+    if "qwin" in out and "qwin_weight" in batch:
+        logit = out["qwin"].float().gather(1, batch["action"].long().unsqueeze(1)).squeeze(1)
+        w = batch["qwin_weight"]
+        per = F.binary_cross_entropy_with_logits(logit, batch["qwin_target"].float(),
+                                                 reduction="none")
+        win_loss = (w * per).sum() / w.sum().clamp_min(1.0)
+        total = total + getattr(training, "win_loss_weight", 1.0) * win_loss
     with torch.no_grad():
         probs = log_probs.exp().masked_fill(~mask, 0.0)
         entropy = ((weight * -(probs * log_probs).sum(-1)).sum() / weight_sum)
@@ -168,7 +176,7 @@ def compute_losses(out: dict, batch: dict, training, value_head: str) -> dict:
         value_mse = (out["value"].float() - win).square().mean()
     return {"total": total, "policy": policy_loss, "value": value_loss, "margin": margin_loss,
             "policy_entropy": entropy, "policy_top1": top1, "value_mse": value_mse,
-            "q": q_loss}
+            "q": q_loss, "win": win_loss}
 
 
 def new_run_dir(config: Config) -> Path:
@@ -334,7 +342,7 @@ class Trainer:
         # Q / afterstate heads may be added to a warm start that lacks them (they
         # start at zero); new keys must then belong to those heads only.
         new_prefixes = []
-        for flag, prefix in (("q_head", "q."), ("after_head", "after.")):
+        for flag, prefix in (("q_head", "q."), ("after_head", "after."), ("win_head", "qwin.")):
             if ours[flag] and not theirs[flag]:
                 theirs[flag] = True
                 new_prefixes.append(prefix)
@@ -403,6 +411,7 @@ class Trainer:
             cfg.selfplay.full_search_probability, cfg.selfplay.fast_simulations,
             cfg.selfplay.full_simulations, cfg.selfplay.td_lambda,
             cfg.selfplay.explore_epsilon, bool(cfg.model.q_head), cfg.selfplay.luck_samples,
+            bool(cfg.model.win_head),
         ) for i in range(cfg.selfplay.games_per_iteration)]
         started = time.perf_counter()
         results = executor.map("selfplay", tasks, self._progress("self-play"))
@@ -496,7 +505,7 @@ class Trainer:
             torch.cuda.reset_peak_memory_stats()
         self.model.train()
         names = ("total", "policy", "value", "margin", "policy_entropy", "policy_top1",
-                 "value_mse", "q")
+                 "value_mse", "q", "win")
         # Accumulate on the device; one host synchronization per iteration.
         sums = {name: torch.zeros((), device=self.device) for name in names}
         grad_norm_sum = torch.zeros((), device=self.device)
@@ -532,7 +541,8 @@ class Trainer:
         self.counters["optimizer_steps"] += steps
         self.counters["training_samples"] += steps * cfg.batch_size
         self.model.eval()
-        stats = {f"{name}_loss" if name in ("total", "policy", "value", "margin", "q") else name:
+        stats = {f"{name}_loss" if name in ("total", "policy", "value", "margin", "q", "win")
+                 else name:
                  value / steps for name, value in sums.items()}
         stats.update(
             loss=sums["total"] / steps, steps=steps, batch_size=cfg.batch_size,
@@ -649,7 +659,7 @@ def summary_line(record: dict) -> str:
         parts.append(f"reanalyse {ra['positions']}pos {ra['wall_seconds']:.0f}s")
     if not tr.get("skipped"):
         parts.append(f"loss {tr['loss']:.3f} (p {tr['policy_loss']:.3f} v {tr['value_loss']:.3f} "
-                     f"m {tr['margin_loss']:.3f} q {tr.get('q_loss', 0.0):.4f}) "
+                     f"m {tr['margin_loss']:.3f} q {tr.get('q_loss', 0.0):.4f} w {tr.get('win_loss', 0.0):.4f}) "
                      f"{tr['samples_per_second']:.0f} samples/s")
     if record.get("arena"):
         parts.append(f"arena {record['arena']['win_rate']:.2f}"
